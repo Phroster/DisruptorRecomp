@@ -1,0 +1,136 @@
+diff --git a/runtime/include/freeze_heartbeat.h b/runtime/include/freeze_heartbeat.h
+index 1d2314c6..260b3ca1 100644
+--- a/runtime/include/freeze_heartbeat.h
++++ b/runtime/include/freeze_heartbeat.h
+@@ -1,7 +1,8 @@
+ ﻿/* freeze_heartbeat.h — observability infrastructure.
+  *
+- * Starts a background thread that snapshots runtime state to
+- * `psx_freeze_heartbeat.json` every ~100 ms. Survives main-thread
++ * Starts a background thread that samples runtime state every ~100 ms and
++ * rewrites `logs/psx_freeze_heartbeat.json` about once a second. Survives
++ * main-thread
+  * freezes (Windows / SDL "Not Responding") because the writer thread
+  * is independent of the main loop and the debug-server TCP path.
+  *
+diff --git a/runtime/src/freeze_heartbeat.c b/runtime/src/freeze_heartbeat.c
+index 46d82b9d..f4bb7320 100644
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -14,6 +14,8 @@
+ #ifdef _WIN32
+ #include <windows.h>
+ #include <dbghelp.h>
++#else
++#include <sys/stat.h>
+ #endif
+ 
+ /* State accessors. All defined in other compilation units; declared here
+@@ -66,6 +68,10 @@ extern uint32_t g_ra_tw_frame, g_ra_tw_in_exc, g_ra_tw_sp;
+ extern uint32_t g_present_slow_count;
+ extern int      g_present_vsync_disabled;
+ 
++/* Game-start latch (fntrace.c). Automatic wedge dumps stay disabled until the
++ * BIOS hands control to the game EXE — see heartbeat_write. */
++extern int fntrace_is_game_started(void);
++
+ /* CPU register file + scratchpad — captured into the heartbeat so a logical
+  * hang's exact wedged state survives in the small, user-uploadable file.
+  * debug_cpu_ptr (CPUState*) is declared in debug_server.h; CPUState layout
+@@ -83,9 +89,27 @@ static DWORD  s_main_thread_id = 0;
+ static int    s_sym_initialized = 0;
+ #endif
+ 
+-#define HB_FILE        "psx_freeze_heartbeat.json"
++#define HB_DIR         "logs"
++#define HB_FILE        HB_DIR "/psx_freeze_heartbeat.json"
+ #define HB_INTERVAL_MS 100u
+ 
++/* Sampling, the ring and wedge classification stay per-tick; only the JSON
++ * rewrite is decoupled from them. The file is forensic state, not a live
++ * feed, so 10 ticks = 1 s is plenty — and 10x less disk churn than the old
++ * per-tick rewrite (22 KB/tick with the CPU + scratchpad payload). */
++#define HB_FILE_FLUSH_TICKS 10u
++
++/* Both the per-tick file and the auto/fatal dumps land under logs/ next to
++ * the working directory. Create it on first use; if it cannot be created,
++ * the following fopen fails exactly as it did before this moved. */
++static void hb_ensure_log_dir(void) {
++#ifdef _WIN32
++    (void)CreateDirectoryA(HB_DIR, NULL);
++#else
++    (void)mkdir(HB_DIR, 0755);
++#endif
++}
++
+ /* Wedge detection.
+  *
+  * Three failure modes to catch:
+@@ -486,13 +510,16 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
+         return 0;
+ #endif
+ 
+-    char path[128];
++    char name[128];
++    char path[192];
+     uint32_t sequence = s_dump_sequence++;
+-    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
++    if (!freeze_dump_format_path(name, sizeof(name), s_backend, wall, sequence)) {
+         freeze_dump_unlock();
+         return 0;
+     }
++    snprintf(path, sizeof(path), HB_DIR "/%s", name);
+ 
++    hb_ensure_log_dir();
+     FILE *f = fopen(path, "wb");
+     if (!f) { freeze_dump_unlock(); return 0; }
+ 
+@@ -818,7 +845,12 @@ static void heartbeat_write(void) {
+             wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
+     }
+ 
+-    if (!s_wedge_classification_paused &&
++    /* No automatic dumps before the BIOS hands off to the game: the boot
++     * sequence legitimately spins in kernel waits while VBlank frames keep
++     * advancing, which the spin-freeze detector reads as a wedge (three
++     * false 27 MB dumps were written during OpenBIOS boot). Fatals bypass
++     * this entire path via freeze_heartbeat_fatal_dump. */
++    if (!s_wedge_classification_paused && fntrace_is_game_started() &&
+         freeze_dump_policy_observe(&s_dump_policy, wedge_kind,
+                                    g_psx_fatal_reason != NULL)) {
+         s_last_wedge_kind = wedge_kind;
+@@ -867,6 +899,12 @@ static void heartbeat_write(void) {
+ 
+     /* Buffer sized for current-state JSON + ring (~256B per ring entry). */
+     static char buf[64 * 1024];
++
++    /* Ring/detector work above is per-tick; only the JSON rewrite is
++     * throttled — see HB_FILE_FLUSH_TICKS. */
++    static uint32_t s_flush_tick = 0;
++    if (++s_flush_tick % HB_FILE_FLUSH_TICKS != 0) return;
++
+     int n = snprintf(buf, sizeof(buf),
+         "{\n"
+         "  \"backend\":\"%s\",\n"
+@@ -1056,6 +1094,7 @@ static void heartbeat_write(void) {
+     char tmp_path[64];
+     snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
+ 
++    hb_ensure_log_dir();
+     FILE *f = fopen(tmp_path, "wb");
+     if (!f) return;
+     fwrite(buf, 1, (size_t)n, f);
+@@ -1083,9 +1122,10 @@ void freeze_heartbeat_start(const char *backend_label) {
+     /* INTENTIONALLY not gated by PSX_NO_DEBUG_TOOLS. The heartbeat thread
+      * is the only observability mechanism that survives a main-thread
+      * stall (TCP server is on main thread; debug log functions are
+-     * called from the stalled code). Cost is ~1 KB/sec disk write and
+-     * one extra thread — small enough to keep in production builds for
+-     * crash forensics. */
++     * called from the stalled code). Cost is ~22 KB once a second (ring and
++     * detector run per 100 ms tick; the file rewrite is throttled) and one
++     * extra thread — small enough to keep in production builds for crash
++     * forensics. */
+     if (s_started) return;
+     if (backend_label && backend_label[0]) {
+         size_t n = strlen(backend_label);

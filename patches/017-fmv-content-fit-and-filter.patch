@@ -1,0 +1,97 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 631abb48..78185bf8 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3094,8 +3094,37 @@ void gl_renderer_set_fmv_filter(int cfg_value) {
+     if (cfg_value >= 0 && cfg_value <= 3) s_fmv_filter_cfg = cfg_value;
+ }
+
++/* Presentation overrides apply only to actual RGB888 movie frames, never to
++ * the forced-CPU diagnostic or the 15-bit menus. The game's launcher supplies
++ * the encoded content size; no brightness-based crop (dark scenes must not zoom).
++ * All Disruptor STR headers are 320x180; the player centres them in 320x240. */
++static int fmv_content_height(int src_w, int src_h) {
++    static int checked = 0, width = 0, height = 0;
++    if (!checked) {
++        const char *e = getenv("PSX_GL_FMV_CONTENT");
++        char trailing;
++        checked = 1;
++        if (!e || sscanf(e, "%dx%d%c", &width, &height, &trailing) != 2 ||
++            width <= 0 || width > VRAM_W || height <= 0 || height > VRAM_H) {
++            width = height = 0;
++        }
++    }
++    return width == src_w && height > 0 && height <= src_h ? height : 0;
++}
++
+ static int fmv_filter_mode(void) {
+-    return s_fmv_filter_cfg - 1;
++    static int override = -2;
++    if (override == -2) {
++        const char *e = getenv("PSX_GL_FMV_FILTER");
++        override = -3;  /* no override: use settings.toml */
++        if (e) {
++            if (!strcmp(e, "nearest")) override = -1;
++            else if (!strcmp(e, "bilinear")) override = 0;
++            else if (!strcmp(e, "sharp")) override = 1;
++            else if (!strcmp(e, "bicubic")) override = 2;
++        }
++    }
++    return override >= -1 ? override : s_fmv_filter_cfg - 1;
+ }
+
+ /* Select the present-program sampling mode. s_present_prog is shared by the CPU
+@@ -3613,8 +3642,21 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     glDisable(GL_SCISSOR_TEST);
+     glViewport(0, 0, ww, wh);
+     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
++    const int is_movie = gpu_display_is_depth24();
++    const int movie_h = is_movie ? fmv_content_height(src_w, src_h) : 0;
++    int source_y = 0;
+     int lx, ly, lw, lh;
+-    if (force_4_3)
++    if (movie_h > 0) {
++        /* Remove only the authored player's empty padding. Upload precisely the
++         * content band: bicubic taps clamp to real edge pixels, not black rows.
++         * Preserve the original 4:3 canvas's pixel aspect and fit the complete
++         * movie into the window. No stretch, scene-dependent zoom, or lost image. */
++        letterbox_rect_aspect(ww, wh, 4 * src_h, 3 * movie_h,
++                             &lx, &ly, &lw, &lh);
++        source_y = (src_h - movie_h) / 2;
++        pixels += (size_t)source_y * (size_t)src_w;
++        src_h = movie_h;
++    } else if (force_4_3)
+         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+     else
+         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+@@ -3627,7 +3669,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     /* Genuinely windowed video bands only (<80% of the 240-line field, e.g.
+      * MotK's 128-line FMV). A game's native short display mode (216/224)
+      * fills the rect as on hardware. */
+-    if (src_h > 0 && src_h < 192) {
++    if (!movie_h && src_h > 0 && src_h < 192) {
+         int content_h = (lh * src_h) / 240;
+         if (content_h < 1) content_h = 1;
+         ly += (lh - content_h) / 2;
+@@ -3659,8 +3701,10 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+      * bilinear 0.14%/0.930. Bicubic removes two thirds of the staircase while
+      * holding gradient at the nearest level; bilinear removes the most but
+      * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
+-    int filt_mode = linear ? fmv_filter_mode()
+-                           : -1;          /* AA off: nearest, no shader work */
++    /* Movies have their own reconstruction filter. Gameplay AA stays off so
++     * sprite edges and the supersampled world are not globally blurred. */
++    int filt_mode = is_movie ? fmv_filter_mode()
++                            : (linear ? s_fmv_filter_cfg - 1 : -1);
+     glViewport(lx, ly, lw, lh);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
+@@ -3688,7 +3732,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     }
+     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
+     p_glBindVertexArray(0); p_glUseProgram(0);
+-    pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
++    pres_record(GL_PRES_CPU, 0, source_y, src_w, src_h, lx, ly, lw, lh);
+     hold_capture_drawable();
+     latency_ring_mark(LAT_SWAP_BEGIN);
+     gl_swap_with_osd();

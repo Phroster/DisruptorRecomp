@@ -1,0 +1,22 @@
+diff --git a/recompiler/tests/test_aot_overlay_discovery.py b/recompiler/tests/test_aot_overlay_discovery.py
+index f84c9ed8..26d4df40 100644
+--- a/recompiler/tests/test_aot_overlay_discovery.py
++++ b/recompiler/tests/test_aot_overlay_discovery.py
+@@ -1516,7 +1516,7 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
+             import _ctypes
+             import ctypes
+             import shutil
+-            gcc = r'C:\msys64\mingw64\bin\gcc.exe'
++            gcc = shutil.which('gcc') or r'C:\msys64\mingw64\bin\gcc.exe'
+             assert os.path.isfile(gcc), "real loaded-DLL regression needs MinGW gcc"
+             with tempfile.TemporaryDirectory() as tmp:
+                 # The actual host compiler must export the same 64-bit identity
+@@ -2221,7 +2221,7 @@ def check_candidate_capacity_publication():
+     if os.name == 'nt':
+         # Exact pairs racing to distinct names may both commit: the namespace
+         # lock makes the second writer observe the first pair's dedup identity.
+-        gcc = r'C:\msys64\mingw64\bin\gcc.exe'
++        gcc = shutil.which('gcc') or r'C:\msys64\mingw64\bin\gcc.exe'
+         assert os.path.isfile(gcc)
+         with tempfile.TemporaryDirectory() as tmp:
+             pair_id = 0x1020304050607080

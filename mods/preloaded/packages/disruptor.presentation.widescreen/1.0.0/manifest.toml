@@ -1,0 +1,44 @@
+format_version = 5
+id = "disruptor.presentation.widescreen"
+version = "1.0.0"
+name = "Widescreen (16:9)"
+author = "DisruptorRecomp"
+description = "Presents Disruptor in 16:9. The gameplay view widens through the game's own cull margins on the native-wide compositor; menus, FMV and the BIOS stay pillarboxed. Presentation-only, and 4:3 remains the identity when disabled."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-00224"
+
+[[feature]]
+id = "widescreen"
+name = "Widescreen (16:9)"
+description = "Enabled by default. Requests the fixed 16:9 host aspect with native-wide composition, and locks presentation to the monitor refresh via the runtime's frame interpolation (guest logic stays at stock 59.94 Hz). Disable to play in the original 4:3 without interpolation."
+group = "Visual"
+default_enabled = true
+
+[[plugin]]
+feature = "widescreen"
+id = "disruptor.widescreen"
+
+[[feature]]
+id = "mouselook"
+name = "Mouse look"
+description = "Enabled by default. Applies host mouse motion directly to the game's camera yaw every frame (1:1 look, no digital turn-rate ceiling). Disable to use the pad's stock turning."
+group = "Controls"
+default_enabled = true
+
+[[plugin]]
+feature = "mouselook"
+id = "disruptor.mouselook"
+
+[[feature]]
+id = "wheel_select"
+name = "Wheel weapon / psionic select"
+description = "Enabled by default. The mouse wheel scrolls the game's own weapon list (wheel down = next, wheel up = previous) and selects a moment after the last notch; with the psionic list held open it scrolls the psionic powers. Disable to give the wheel back to keybinds.ini."
+group = "Controls"
+default_enabled = true
+
+[[plugin]]
+feature = "wheel_select"
+id = "disruptor.wheel_select"

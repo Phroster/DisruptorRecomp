@@ -1,0 +1,25 @@
+# Extra function seeds: runtime-captured interior entries that the first-pass
+# JAL scan misses (computed jumps into function interiors, captured at runtime).
+# build.ps1 appends this file to input/functions.txt after prepare_disc.py
+# regenerates it. Addresses are physical (0x800xxxxx virtual form accepted).
+0x800117b4
+0x80011f14
+0x80012238
+0x80020d34
+0x80049048
+0x8004fb48
+# func_80045D78 (asset decompressor) uses computed gotos instead of a jump
+# table: jr $t3 = 0x80045E5C + n*0x80 and jr $t2 = 0x800460AC + n*0x20
+# (n = 0..3). The n = 0 targets are already block leaders; these six are not,
+# so without seeds they have no dispatch entry and run in the interpreter.
+0x80045edc
+0x80045f5c
+0x80045fdc
+0x800460cc
+0x800460ec
+0x8004610c
+# func_80056928 is the B0:0x4E BIOS stub (3 instructions), the last function
+# before the data section. Without a boundary its range ran on through 90 KB of
+# data, strict translation failed and it was emitted as an unknown-dispatch stub
+# (interpreted). This seed ends it at the first non-code word.
+0x80056934

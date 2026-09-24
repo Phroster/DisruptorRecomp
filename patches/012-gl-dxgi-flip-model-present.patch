@@ -1,0 +1,489 @@
+diff --git a/runtime/include/gl_dxgi_present.h b/runtime/include/gl_dxgi_present.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/include/gl_dxgi_present.h
+@@ -0,0 +1,28 @@
++/* gl_dxgi_present.h - DXGI flip-model presentation for the OpenGL renderer
++ * (Windows). See gl_dxgi_present.c. All functions are no-ops returning 0 on
++ * other platforms. Call from the thread that owns the GL context. */
++#ifndef GL_DXGI_PRESENT_H
++#define GL_DXGI_PRESENT_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct SDL_Window;
++
++/* After the GL context is current. Returns 1 when the DXGI path is active. */
++int gl_dxgi_present_init(struct SDL_Window *win);
++/* Present GL framebuffer 0 (w x h drawable pixels). swap_interval: 0 =
++ * immediate (tearing/VRR allowed), N = sync to every Nth vblank. Returns 1 if
++ * the frame was presented here; 0 means the caller must do the GL swap. */
++int gl_dxgi_present_frame(int w, int h, int swap_interval);
++void gl_dxgi_present_shutdown(void);
++int gl_dxgi_present_active(void);
++uint64_t gl_dxgi_present_frames(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -339,6 +339,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_vram_dirty.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
++    ${PSXRECOMP_ROOT}/runtime/src/gl_dxgi_present.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
+     ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
+     ${PSXRECOMP_ROOT}/runtime/src/dma.c
+@@ -2026,6 +2027,8 @@ function(psxrecomp_add_runtime_target target)
+         # iphlpapi: GetAdaptersAddresses in the launcher's netplay
+         # local-address discovery (MSVC does not link it implicitly).
+         target_link_libraries(${target} PRIVATE ws2_32 iphlpapi dbghelp comdlg32 opengl32)
++        # gl_dxgi_present.c: DXGI flip-model presentation for the GL renderer.
++        target_link_libraries(${target} PRIVATE d3d11 dxgi)
+         # Newer mingw-w64 maps clock_gettime → clock_gettime64 in libwinpthread.
+         # Link it even when netplay code prefers Win32 clocks, so any residual
+         # POSIX time refs (third-party / debug tools) resolve under -static.
+diff --git a/runtime/src/gl_dxgi_present.c b/runtime/src/gl_dxgi_present.c
+new file mode 100644
+--- /dev/null
++++ b/runtime/src/gl_dxgi_present.c
+@@ -0,0 +1,323 @@
++/* gl_dxgi_present.c - present the OpenGL frame through a DXGI flip-model
++ * swapchain (Windows).
++ *
++ * A native OpenGL SwapBuffers reaches the desktop compositor as a legacy
++ * (blit-model) surface: no direct/independent flip, no variable refresh in a
++ * window or borderless window, and on current NVIDIA drivers the swap does not
++ * block on vblank either, so a wall-clock-paced 59.94 fps stream judders on
++ * any panel that is not an exact multiple. The presentation model Windows
++ * 10/11 is built around is the DXGI flip model (FLIP_DISCARD + ALLOW_TEARING):
++ * it is what gets independent flip and VRR for windowed content.
++ *
++ * The renderer is left untouched. At the single swap site the composed back
++ * buffer (GL framebuffer 0) is blitted, Y-flipped, into a texture shared with a
++ * D3D11 device (WGL_NV_DX_interop2), copied into the swapchain's back buffer
++ * and presented. GL SwapBuffers is never called on the window once this path
++ * is active. Every failure falls back to the plain GL swap before the first
++ * DXGI present, so drivers without the interop extension behave as before.
++ *
++ * PSX_GL_DXGI=0 disables the path. */
++#include "gl_dxgi_present.h"
++
++#ifdef _WIN32
++
++#include <initguid.h>
++#define COBJMACROS
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <d3d11.h>
++#include <dxgi1_5.h>
++#include <GL/gl.h>
++#include "psx_sdl.h"
++#if !defined(PSX_SDL3)
++#include <SDL_syswm.h>
++#endif
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifndef GL_READ_FRAMEBUFFER
++#define GL_READ_FRAMEBUFFER 0x8CA8
++#define GL_DRAW_FRAMEBUFFER 0x8CA9
++#define GL_FRAMEBUFFER 0x8D40
++#define GL_COLOR_ATTACHMENT0 0x8CE0
++#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
++#endif
++#define PSX_WGL_ACCESS_WRITE_DISCARD_NV 0x0002
++
++typedef void   (APIENTRY *fn_glGenFramebuffers)(GLsizei, GLuint *);
++typedef void   (APIENTRY *fn_glDeleteFramebuffers)(GLsizei, const GLuint *);
++typedef void   (APIENTRY *fn_glBindFramebuffer)(GLenum, GLuint);
++typedef void   (APIENTRY *fn_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
++typedef GLenum (APIENTRY *fn_glCheckFramebufferStatus)(GLenum);
++typedef void   (APIENTRY *fn_glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint,
++                                                GLint, GLint, GLbitfield, GLenum);
++typedef HANDLE (WINAPI *fn_wglDXOpenDeviceNV)(void *);
++typedef BOOL   (WINAPI *fn_wglDXCloseDeviceNV)(HANDLE);
++typedef HANDLE (WINAPI *fn_wglDXRegisterObjectNV)(HANDLE, void *, GLuint, GLenum, GLenum);
++typedef BOOL   (WINAPI *fn_wglDXUnregisterObjectNV)(HANDLE, HANDLE);
++typedef BOOL   (WINAPI *fn_wglDXLockObjectsNV)(HANDLE, GLint, HANDLE *);
++typedef BOOL   (WINAPI *fn_wglDXUnlockObjectsNV)(HANDLE, GLint, HANDLE *);
++
++static fn_glGenFramebuffers        x_glGenFramebuffers;
++static fn_glDeleteFramebuffers     x_glDeleteFramebuffers;
++static fn_glBindFramebuffer        x_glBindFramebuffer;
++static fn_glFramebufferTexture2D   x_glFramebufferTexture2D;
++static fn_glCheckFramebufferStatus x_glCheckFramebufferStatus;
++static fn_glBlitFramebuffer        x_glBlitFramebuffer;
++static fn_wglDXOpenDeviceNV        x_wglDXOpenDeviceNV;
++static fn_wglDXCloseDeviceNV       x_wglDXCloseDeviceNV;
++static fn_wglDXRegisterObjectNV    x_wglDXRegisterObjectNV;
++static fn_wglDXUnregisterObjectNV  x_wglDXUnregisterObjectNV;
++static fn_wglDXLockObjectsNV       x_wglDXLockObjectsNV;
++static fn_wglDXUnlockObjectsNV     x_wglDXUnlockObjectsNV;
++
++extern void psx_present_deferred_pace(void);   /* main.cpp */
++
++static ID3D11Device        *s_dev;
++static ID3D11DeviceContext *s_ctx;
++static IDXGISwapChain1     *s_sc;
++static ID3D11Texture2D     *s_tex;      /* shared with GL */
++static HANDLE               s_interop;  /* wglDXOpenDeviceNV */
++static HANDLE               s_obj;      /* registered s_tex <-> s_gl_tex */
++static GLuint               s_gl_tex, s_fbo;
++static int                  s_w, s_h, s_ready, s_tearing, s_presented;
++static UINT                 s_sc_flags;
++static uint64_t             s_frames;
++
++static void release_target(void) {
++    if (s_obj && s_interop) x_wglDXUnregisterObjectNV(s_interop, s_obj);
++    s_obj = NULL;
++    if (s_fbo) { x_glDeleteFramebuffers(1, &s_fbo); s_fbo = 0; }
++    if (s_gl_tex) { glDeleteTextures(1, &s_gl_tex); s_gl_tex = 0; }
++    if (s_tex) { ID3D11Texture2D_Release(s_tex); s_tex = NULL; }
++}
++
++static int create_target(int w, int h) {
++    D3D11_TEXTURE2D_DESC td;
++    ZeroMemory(&td, sizeof td);
++    td.Width = (UINT)w;
++    td.Height = (UINT)h;
++    td.MipLevels = 1;
++    td.ArraySize = 1;
++    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    td.SampleDesc.Count = 1;
++    td.Usage = D3D11_USAGE_DEFAULT;
++    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_tex))) return 0;
++    glGenTextures(1, &s_gl_tex);
++    s_obj = x_wglDXRegisterObjectNV(s_interop, s_tex, s_gl_tex, GL_TEXTURE_2D,
++                                    PSX_WGL_ACCESS_WRITE_DISCARD_NV);
++    if (!s_obj) return 0;
++    x_glGenFramebuffers(1, &s_fbo);
++    if (!x_wglDXLockObjectsNV(s_interop, 1, &s_obj)) return 0;
++    x_glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
++    x_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_gl_tex, 0);
++    GLenum st = x_glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    x_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    x_wglDXUnlockObjectsNV(s_interop, 1, &s_obj);
++    if (st != GL_FRAMEBUFFER_COMPLETE) return 0;
++    s_w = w;
++    s_h = h;
++    return 1;
++}
++
++void gl_dxgi_present_shutdown(void) {
++    s_ready = 0;
++    if (s_interop) release_target();
++    if (s_interop) { x_wglDXCloseDeviceNV(s_interop); s_interop = NULL; }
++    if (s_sc)  { IDXGISwapChain1_Release(s_sc); s_sc = NULL; }
++    if (s_ctx) { ID3D11DeviceContext_Release(s_ctx); s_ctx = NULL; }
++    if (s_dev) { ID3D11Device_Release(s_dev); s_dev = NULL; }
++}
++
++static int fail(const char *what) {
++    fprintf(stdout, "psxrecomp: DXGI present unavailable (%s); using the GL swap\n", what);
++    gl_dxgi_present_shutdown();
++    return 0;
++}
++
++int gl_dxgi_present_init(SDL_Window *win) {
++    const char *e = getenv("PSX_GL_DXGI");
++    if (e && e[0] == '0') return 0;
++    if (s_ready) return 1;
++
++#define LOAD(name) do { x_##name = (fn_##name)SDL_GL_GetProcAddress(#name); \
++                        if (!x_##name) return fail(#name " missing"); } while (0)
++    LOAD(glGenFramebuffers); LOAD(glDeleteFramebuffers); LOAD(glBindFramebuffer);
++    LOAD(glFramebufferTexture2D); LOAD(glCheckFramebufferStatus); LOAD(glBlitFramebuffer);
++    LOAD(wglDXOpenDeviceNV); LOAD(wglDXCloseDeviceNV); LOAD(wglDXRegisterObjectNV);
++    LOAD(wglDXUnregisterObjectNV); LOAD(wglDXLockObjectsNV); LOAD(wglDXUnlockObjectsNV);
++#undef LOAD
++
++#if defined(PSX_SDL3)
++    HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win),
++                                             SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
++    if (!hwnd) return fail("no HWND");
++#else
++    SDL_SysWMinfo wm;
++    SDL_VERSION(&wm.version);
++    if (!SDL_GetWindowWMInfo(win, &wm) || wm.subsystem != SDL_SYSWM_WINDOWS)
++        return fail("no HWND");
++    HWND hwnd = wm.info.win.window;
++#endif
++
++    D3D_FEATURE_LEVEL fl;
++    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
++                                 D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx)))
++        return fail("D3D11CreateDevice");
++
++    IDXGIDevice1 *dxdev = NULL;
++    IDXGIAdapter *adapter = NULL;
++    IDXGIFactory2 *factory = NULL;
++    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&dxdev)))
++        return fail("IDXGIDevice1");
++    IDXGIDevice1_SetMaximumFrameLatency(dxdev, 1);
++    HRESULT hr = IDXGIDevice1_GetAdapter(dxdev, &adapter);
++    IDXGIDevice1_Release(dxdev);
++    if (FAILED(hr)) return fail("GetAdapter");
++    hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory);
++    IDXGIAdapter_Release(adapter);
++    if (FAILED(hr)) return fail("IDXGIFactory2");
++
++    IDXGIFactory5 *f5 = NULL;
++    s_tearing = 0;
++    if (SUCCEEDED(IDXGIFactory2_QueryInterface(factory, &IID_IDXGIFactory5, (void **)&f5))) {
++        BOOL allow = FALSE;
++        if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
++                                                        &allow, sizeof allow)))
++            s_tearing = allow ? 1 : 0;
++        IDXGIFactory5_Release(f5);
++    }
++
++    int w = 0, h = 0;
++    SDL_GL_GetDrawableSize(win, &w, &h);
++    if (w <= 0 || h <= 0) { IDXGIFactory2_Release(factory); return fail("window size"); }
++
++    DXGI_SWAP_CHAIN_DESC1 sd;
++    ZeroMemory(&sd, sizeof sd);
++    sd.Width = (UINT)w;
++    sd.Height = (UINT)h;
++    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    sd.SampleDesc.Count = 1;
++    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    sd.BufferCount = 2;
++    sd.Scaling = DXGI_SCALING_STRETCH;
++    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++    s_sc_flags = s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
++    sd.Flags = s_sc_flags;
++    hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)s_dev, hwnd, &sd,
++                                              NULL, NULL, &s_sc);
++    if (SUCCEEDED(hr))   /* the runtime owns Alt+Enter */
++        IDXGIFactory2_MakeWindowAssociation(factory, hwnd, DXGI_MWA_NO_ALT_ENTER |
++                                                           DXGI_MWA_NO_WINDOW_CHANGES);
++    IDXGIFactory2_Release(factory);
++    if (FAILED(hr)) return fail("CreateSwapChainForHwnd");
++
++    s_interop = x_wglDXOpenDeviceNV(s_dev);
++    if (!s_interop) return fail("wglDXOpenDeviceNV");
++    if (!create_target(w, h)) return fail("shared render target");
++
++    s_ready = 1;
++    fprintf(stdout, "psxrecomp: present path: DXGI flip model via GL/D3D11 interop "
++                    "(%dx%d, tearing/VRR %s)\n", w, h, s_tearing ? "allowed" : "not supported");
++    return 1;
++}
++
++/* Is G-SYNC really engaged for this swapchain? Asked of the NVIDIA driver
++ * through its public NVAPI entry point (nvapi_QueryInterface + the function
++ * ids published in nvapi_interface.h); silently absent on other vendors.
++ * Logged when the answer changes, so a run's log says what the panel did
++ * without relying on the driver's on-screen indicator. */
++typedef void *(*fn_nvapi_query)(unsigned int id);
++typedef int (*fn_nvapi_init)(void);
++typedef int (*fn_nvapi_get_handle)(IUnknown *dev, IUnknown *res, void **handle);
++typedef int (*fn_nvapi_gsync)(IUnknown *dev, void *surface, BOOL *out);
++
++static void gsync_probe(ID3D11Texture2D *backbuffer) {
++    static int s_state = 0;           /* 0 untried, 1 usable, -1 unavailable */
++    static int s_last_capable = -1, s_last_active = -1;
++    static fn_nvapi_get_handle get_handle;
++    static fn_nvapi_gsync is_capable, is_active;
++    if (s_state < 0) return;
++    if (s_state == 0) {
++        s_state = -1;
++        HMODULE lib = LoadLibraryA("nvapi64.dll");
++        fn_nvapi_query query = lib ? (fn_nvapi_query)(void *)GetProcAddress(lib, "nvapi_QueryInterface") : NULL;
++        if (!query) return;
++        fn_nvapi_init init = (fn_nvapi_init)query(0x0150E828u);
++        get_handle = (fn_nvapi_get_handle)query(0xFCEAC864u);
++        is_capable = (fn_nvapi_gsync)query(0x9C1EED78u);
++        is_active  = (fn_nvapi_gsync)query(0xE942B0FFu);
++        if (!init || !get_handle || !is_capable || !is_active || init() != 0) return;
++        s_state = 1;
++    }
++    void *surface = NULL;
++    BOOL capable = FALSE, active = FALSE;
++    if (get_handle((IUnknown *)s_dev, (IUnknown *)backbuffer, &surface) != 0 || !surface) return;
++    if (is_capable((IUnknown *)s_dev, surface, &capable) != 0) return;
++    if (is_active((IUnknown *)s_dev, surface, &active) != 0) return;
++    if ((int)capable != s_last_capable || (int)active != s_last_active) {
++        s_last_capable = (int)capable;
++        s_last_active = (int)active;
++        fprintf(stdout, "psxrecomp: G-SYNC capable=%d active=%d (frame %llu)\n",
++                (int)capable, (int)active, (unsigned long long)s_frames);
++        fflush(stdout);
++    }
++}
++
++int gl_dxgi_present_frame(int w, int h, int swap_interval) {
++    if (!s_ready || w <= 0 || h <= 0) return 0;
++    if (w != s_w || h != s_h) {
++        release_target();
++        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_sc, 0, (UINT)w, (UINT)h,
++                                                 DXGI_FORMAT_UNKNOWN, s_sc_flags)) ||
++            !create_target(w, h)) {
++            fail("resize");
++            return s_presented ? 1 : 0;   /* a flip-model window cannot go back to GL swaps */
++        }
++    }
++    if (!x_wglDXLockObjectsNV(s_interop, 1, &s_obj)) return s_presented ? 1 : 0;
++    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++    if (scissor) glDisable(GL_SCISSOR_TEST);
++    x_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    x_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_fbo);
++    /* GL rows are bottom-up, D3D rows top-down: flip while copying. */
++    x_glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    x_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    if (scissor) glEnable(GL_SCISSOR_TEST);
++    x_wglDXUnlockObjectsNV(s_interop, 1, &s_obj);
++
++    ID3D11Texture2D *bb = NULL;
++    if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_sc, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
++        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)bb, (ID3D11Resource *)s_tex);
++        if ((s_frames % 120u) == 60u) gsync_probe(bb);
++        ID3D11Texture2D_Release(bb);
++    }
++    /* Submit now so the GPU works through the frame during the pacer's wait;
++     * then wait out the frame deadline HERE, so the only thing between the
++     * deadline and the flip is the constant-time Present() call. */
++    ID3D11DeviceContext_Flush(s_ctx);
++    psx_present_deferred_pace();
++    UINT interval = swap_interval > 0 ? (UINT)swap_interval : 0u;
++    UINT flags = (interval == 0 && s_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
++    IDXGISwapChain1_Present(s_sc, interval, flags);
++    s_presented = 1;
++    s_frames++;
++    return 1;
++}
++
++int gl_dxgi_present_active(void) { return s_ready; }
++uint64_t gl_dxgi_present_frames(void) { return s_frames; }
++
++#else  /* !_WIN32 */
++
++int gl_dxgi_present_init(SDL_Window *win) { (void)win; return 0; }
++int gl_dxgi_present_frame(int w, int h, int swap_interval) {
++    (void)w; (void)h; (void)swap_interval; return 0;
++}
++void gl_dxgi_present_shutdown(void) {}
++int gl_dxgi_present_active(void) { return 0; }
++uint64_t gl_dxgi_present_frames(void) { return 0; }
++
++#endif
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -67,6 +67,7 @@
+ #include "gpu_render.h"
+ #include "gpu_sw_renderer.h"
+ #include "gpu_gl_renderer.h"
++#include "gl_dxgi_present.h"
+ #include "mod_texture_banks.h"
+ #include "frame_interpolation.h"
+ #include "host_osd.h"
+@@ -3120,6 +3121,10 @@ int gl_renderer_init_context(SDL_Window *win) {
+         s_raster_ok = 0;
+         return 0;
+     }
++    /* Windows: present through a DXGI flip-model swapchain (VRR / independent
++     * flip for windowed and borderless). Falls back to the GL swap if the
++     * driver lacks WGL_NV_DX_interop2. */
++    gl_dxgi_present_init(win);
+     return 1;
+ }
+ 
+@@ -3145,6 +3150,7 @@ void gl_renderer_shutdown(void) {
+     s_selected_bank_tex = s_tb_bank_tex = 0;
+     if (s_ctx) {
+         ensure_cpu();
++        gl_dxgi_present_shutdown();
+         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
+     }
+     free(s_conv); s_conv = NULL;
+@@ -4284,7 +4290,12 @@ static void gl_swap_with_osd(void) {
+             present_shot_done(wrote);
+         }
+     }
+-    SDL_GL_SwapWindow(s_win);
++    {
++        int dw = 0, dh = 0;
++        SDL_GL_GetDrawableSize(s_win, &dw, &dh);
++        if (!gl_dxgi_present_frame(dw, dh, s_swap_interval))
++            SDL_GL_SwapWindow(s_win);
++    }
+ }
+ 
+ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -43,6 +43,7 @@ extern "C" void psx_cpu_overclock_env_init(void);
+ #include "gpu_sw_renderer.h"
+ #include "gpu_render.h"
+ #include "gpu_gl_renderer.h"
++#include "gl_dxgi_present.h"
+ /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
+ #define STBI_NO_STDIO
+ #include "../third_party/stb_image.h"
+@@ -3668,6 +3669,25 @@ static void runtime_perf_section_end(uint64_t start, uint64_t *total) {
+     if (end >= start) *total += end - start;
+ }
+ 
++/* Deferred frame pacing (DXGI present path). Everything the present does
++ * before the flip - compose, OSD, the GL->D3D blit and copy - takes a variable
++ * 1-3.5 ms. When that ran AFTER the pacer released the frame, the variation
++ * landed on the photon time (measured: 429 of 957 off-cadence frames). With
++ * the flag set the presenter calls psx_present_deferred_pace() immediately
++ * before Present(), so only a constant-time call follows the wait, and the GPU
++ * gets the wait as a head start on the frame. The guard runs the wait on the
++ * paths that return without presenting, so the guest can never free-run. */
++static int s_present_pace_deferred = 0;
++extern "C" void psx_present_deferred_pace(void) {
++    if (!s_present_pace_deferred) return;
++    s_present_pace_deferred = 0;
++    uint64_t perf_start = runtime_perf_section_begin();
++    frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
++    runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
++    latency_ring_mark(LAT_PACED);
++}
++struct DeferredPaceGuard { ~DeferredPaceGuard() { psx_present_deferred_pace(); } };
++
+ static void runtime_perf_diag_tick() {
+     static bool have_last = false;
+     static RuntimePerfSnapshot last;
+@@ -6568,6 +6588,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
+      * next tick has a live native chain under its dispatch again. */
+     psx_scheduler_top_level_resume_clear();
++    DeferredPaceGuard deferred_pace_guard;   /* see psx_present_deferred_pace */
+     int probe_turbo = 0;
+     int probe_reached = 0;
+     struct PostLoadProbeScope {
+@@ -7161,10 +7182,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+      * resim. */
+     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+         uint64_t perf_start = runtime_perf_section_begin();
+-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace())
+-            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
++        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
++            if (g_gl_active && gl_dxgi_present_active())
++                s_present_pace_deferred = 1;   /* waited right before Present() */
++            else
++                frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
++        }
+         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
+-        latency_ring_mark(LAT_PACED);
++        if (!s_present_pace_deferred)
++            latency_ring_mark(LAT_PACED);
+ 
+         /* Low-latency input: the early sample above is now ~one pacer-wait old.
+          * Refresh the device state and re-sample right before present so the next

@@ -1,0 +1,15 @@
+diff --git a/runtime/src/recomp_audio_drc.h b/runtime/src/recomp_audio_drc.h
+index c96f141a..adeb22e3 100644
+--- a/runtime/src/recomp_audio_drc.h
++++ b/runtime/src/recomp_audio_drc.h
+@@ -149,8 +149,8 @@ void rab_config_defaults(rab_config *c) {
+      * Keep 180 ms so the measured pause retains more than one callback of
+      * reserve. Sustained slow emulation still drains it and remains visible
+      * in telemetry. A 280 ms ring preserves 100 ms of overflow headroom. */
+-    c->target_ms      = 180.0;
+-    c->ring_ms        = 280.0;
++    c->target_ms      = 320.0;
++    c->ring_ms        = 520.0;
+     c->kp             = 0.02;
+     /* P-only intentionally: the former 0.02/s integral retained a +0.5%
+      * correction after transition bursts and drained a steady 59.94 Hz

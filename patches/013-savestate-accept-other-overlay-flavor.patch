@@ -1,0 +1,19 @@
+diff --git a/runtime/src/boot_state.c b/runtime/src/boot_state.c
+index 0a644f4d..0c10de6c 100644
+--- a/runtime/src/boot_state.c
++++ b/runtime/src/boot_state.c
+@@ -786,7 +786,13 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
+                  (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+         boot_state_append_reason(reason, reason_cap, part);
+     }
+-    if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
++    /* The tag's high half is the overlay flavor (0 = base, 2 = PGXP). A state
++     * holds guest machine state only, and a restore drops every PGXP shadow
++     * (gte_precision_timeline_invalidate), so a state written by the other
++     * flavor of the same build is valid. Compare the ABI half only: without
++     * this, switching a title to its PGXP build orphans the player's states
++     * ("reject - abi_tag=23(want 131095)"). */
++    if ((h.abi_tag & 0xFFFF) != ((int32_t)PSX_OVERLAY_ABI_TAG & 0xFFFF)) {
+         snprintf(part, sizeof(part), "abi_tag=%d(want %d)",
+                  (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
+         boot_state_append_reason(reason, reason_cap, part);

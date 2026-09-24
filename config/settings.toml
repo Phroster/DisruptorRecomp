@@ -1,0 +1,17 @@
+# Default player settings, installed as build\settings.toml by run.ps1 when
+# that file does not exist yet, and by Setup for players. This runtime build
+# only reads the file (it has no settings menu); the release launcher edits the
+# installed copy. This template is never overwritten.
+[video]
+# 1 = borderless fullscreen at the desktop resolution (Alt+Enter toggles).
+# A 16:9 desktop gives the widescreen view its real aspect. G-SYNC/VRR does
+# not depend on this any more: runtime patch 012 presents through a DXGI
+# flip-model swapchain, which Windows gives VRR in a window as well.
+fullscreen = 1
+# Present immediately and let the runtime's wall-clock pacer set the cadence
+# (measured in gameplay: 16.683 ms period, p95 16.700 ms). With G-SYNC the
+# panel follows that exactly; "immediate" is also what lets the DXGI present
+# path use ALLOW_TEARING, which VRR requires. Requesting vsync instead makes
+# the pacer and the vblank clock beat against each other (measured 66-72 % of
+# frames on time versus 92-94 % with "immediate" in the same stretch).
+vsync = "immediate"

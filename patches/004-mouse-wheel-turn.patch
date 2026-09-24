@@ -1,0 +1,353 @@
+diff --git a/runtime/include/psx_keybinds.h b/runtime/include/psx_keybinds.h
+index 9d9072bd..f96ff7a1 100644
+--- a/runtime/include/psx_keybinds.h
++++ b/runtime/include/psx_keybinds.h
+@@ -60,10 +60,41 @@ typedef struct {
+ } PsxKeyBinds;
+ 
+ /* Initialize from <exe_dir>/keybinds.ini. Generates a default file if one does
+- * not exist. exe_path may be NULL/argv[0]/the exe directory itself — the .ini is
++ * not exist. exe_path may be NULL/argv[0]/the exe directory itself �?" the .ini is
+  * placed in that file's directory (or the path itself when it is a directory). */
+ void psx_keybinds_init(const char *exe_path);
+ 
++/* Host mouse feeds for the wheel and relative-motion pseudo-bindings
++ * (MouseWheelUp/Down, MouseX-/MouseX+). The runtime event loop calls these;
++ * the wheel pulses for a couple of frames, relative motion accumulates and
++ * decays across frames so MouseX-/+ read as a held turn while the mouse
++ * keeps moving. */
++void psx_keybinds_mouse_wheel(int dy);
++void psx_keybinds_mouse_motion(float dx);
++/* Vertical relative motion feed (pitch axis) for the same consumers. */
++void psx_keybinds_mouse_motion_y(float dy);
++/* Consume the accumulated relative motion (pixels) since the last call. A
++ * game-owned mouselook plugin takes this each frame and applies it to its
++ * camera; the MouseX-/+ pseudo-bindings are for titles that can only turn at
++ * the pad's fixed rate. */
++float psx_keybinds_take_mouse_dx(void);
++float psx_keybinds_take_mouse_dy(void);
++/* Advance the per-frame pulse/decay state; call once per guest frame. */
++void psx_keybinds_frame_tick(void);
++
++/* Game-mod input hooks. A mod that gives the wheel its own meaning claims it:
++ * the MouseWheelUp/Down pseudo-bindings then stay released and the notches
++ * queue for psx_keybinds_take_wheel_notches (+ up, - down, since the last call).
++ * psx_keybinds_set_mod_buttons holds `press` and lifts `release` (masks of PSX
++ * pad bits, 1 = that button) on player 1's keyboard word, on top of the
++ * bindings; 0, 0 hands the pad back. */
++void psx_keybinds_claim_wheel(int claimed);
++int  psx_keybinds_take_wheel_notches(void);
++void psx_keybinds_set_mod_buttons(uint16_t press, uint16_t release);
++/* Test input: hold (down != 0) or release a keyboard scancode as if the host
++ * key were pressed, merged with the real keyboard state (debug server). */
++void psx_keybinds_debug_key(int scancode, int down);
++
+ /* Read-only view of the current bindings. */
+ const PsxKeyBinds *psx_keybinds_get(void);
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index ca569218..a3f85a6e 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -364,6 +364,72 @@ SDL_Window* sdl_window = nullptr;
+ }
+ static SDL_Renderer* sdl_renderer;
+ static SDL_Texture*  sdl_texture;
++
++/* Host mouse feed for the keybind layer's wheel / relative-turn pseudo-bindings.
++ * Registered with SDL_AddEventWatch so it sees events regardless of which of the
++ * runtime's several SDL_PollEvent loops consumes them. Relative mouse mode is
++ * toggled with window focus: captured while the game window is active (mouse
++ * turning + wheel), released when it is not so the desktop cursor works. */
++static int psx_host_mouse_capture = 0;
++#if defined(PSX_SDL3)
++static bool SDLCALL psx_host_input_watch(void* userdata, SDL_Event* ev) {
++#else
++static int SDLCALL psx_host_input_watch(void* userdata, SDL_Event* ev) {
++#endif
++    (void)userdata;
++#if defined(PSX_SDL3)
++    switch (ev->type) {
++    case SDL_EVENT_MOUSE_WHEEL:
++        psx_keybinds_mouse_wheel((int)ev->wheel.y);
++        break;
++    case SDL_EVENT_MOUSE_MOTION:
++        if (psx_host_mouse_capture) {
++            psx_keybinds_mouse_motion(ev->motion.xrel);
++            psx_keybinds_mouse_motion_y(ev->motion.yrel);
++        }
++        break;
++    case SDL_EVENT_WINDOW_FOCUS_GAINED:
++        if (sdl_window && !psx_host_mouse_capture) {
++            (void)SDL_SetWindowRelativeMouseMode(sdl_window, true);
++            psx_host_mouse_capture = 1;
++        }
++        break;
++    case SDL_EVENT_WINDOW_FOCUS_LOST:
++        if (sdl_window && psx_host_mouse_capture) {
++            (void)SDL_SetWindowRelativeMouseMode(sdl_window, false);
++            psx_host_mouse_capture = 0;
++        }
++        break;
++    default:
++        break;
++    }
++#else
++    switch (ev->type) {
++    case SDL_MOUSEWHEEL:
++        psx_keybinds_mouse_wheel(ev->wheel.y);
++        break;
++    case SDL_MOUSEMOTION:
++        if (psx_host_mouse_capture) {
++            psx_keybinds_mouse_motion((float)ev->motion.xrel);
++            psx_keybinds_mouse_motion_y((float)ev->motion.yrel);
++        }
++        break;
++    case SDL_WINDOWEVENT:
++        if (ev->window.event == SDL_WINDOWEVENT_FOCUS_GAINED && !psx_host_mouse_capture) {
++            SDL_SetRelativeMouseMode(SDL_TRUE);
++            psx_host_mouse_capture = 1;
++        } else if (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST && psx_host_mouse_capture) {
++            SDL_SetRelativeMouseMode(SDL_FALSE);
++            psx_host_mouse_capture = 0;
++        }
++        break;
++    default:
++        break;
++    }
++#endif
++    return true;
++}
++
+ /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
+  * [controller] settings the launcher writes; the runtime opens the matching
+  * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
+@@ -6464,6 +6530,9 @@ struct NetplayVblankEpilogue {
+ /* Called from gpu_vblank_tick() at each simulated vblank. */
+ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     NetplayVblankEpilogue ep{};
++    /* Host mouse pulse/decay state advances once per guest frame (wheel pulse
++     * width, relative-turn hold/release). */
++    psx_keybinds_frame_tick();
+     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
+      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
+      * next tick has a live native chain under its dispatch again. */
+@@ -6782,7 +6851,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         /* Solo resim self-check replay republishes the recorded rows itself —
+          * live sampling must not touch SIO during the replay window. */
+         if (!psx_selfcheck_replay_input()) {
+-            if (g_headless)
++            /* Headless is deterministic (released pad) by default; with
++             * PSX_HEADLESS_INPUT=1 it samples the normal host path so keybind
++             * and mouse pseudo-inputs can be exercised headlessly. */
++            static const bool headless_host_input = [] {
++                const char* e = std::getenv("PSX_HEADLESS_INPUT");
++                return e && e[0] && e[0] != '0';
++            }();
++            if (g_headless && !headless_host_input)
+                 sample_headless_pad_into_sio(override);
+             else
+                 sample_pad_into_sio(override);
+@@ -15018,6 +15094,13 @@ session_reboot:
+ #endif
+ 
+   if (g_headless) {
++    /* Headless still initializes the host input maps so the keybind layer
++     * (mouse wheel/turn pseudo-inputs included) and per-player device routing
++     * resolve identically to a windowed run; SDL keyboard state is simply
++     * absent and reads as released. */
++    std::fprintf(stdout, "psxrecomp: headless argv0=%s\n",
++                 argv[0] ? argv[0] : "(null)");
++    load_input_config(argv[0]);
+     std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+   } else {
+     /* ---- SDL init ---- */
+@@ -15065,6 +15148,8 @@ session_reboot:
+             return 1;
+         }
+     }
++    /* Host mouse wheel / relative-motion feed for the keybind layer. */
++    SDL_AddEventWatch(psx_host_input_watch, nullptr);
+     load_input_config(argv[0]);
+     /* The launcher / settings.toml / game.toml deadzone (when set) is the
+      * user-facing authority; apply it over the input.ini value here, after
+@@ -15146,6 +15231,14 @@ session_reboot:
+         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+         return 1;
+     }
++    /* Capture the cursor for mouse turning from the start; released and
++     * re-captured by the focus events in psx_host_input_watch. */
++#if defined(PSX_SDL3)
++    (void)SDL_SetWindowRelativeMouseMode(sdl_window, true);
++#else
++    SDL_SetRelativeMouseMode(SDL_TRUE);
++#endif
++    psx_host_mouse_capture = 1;
+     psx_apply_window_icon(sdl_window, argv[0]);
+ 
+     /* Maximise instead of computing the frame size ourselves.
+diff --git a/runtime/src/psx_keybinds.c b/runtime/src/psx_keybinds.c
+index 2cdea345..0a8e41a1 100644
+--- a/runtime/src/psx_keybinds.c
++++ b/runtime/src/psx_keybinds.c
+@@ -24,6 +24,97 @@
+ #define PSXKB_IS_MOUSE_SC(sc) \
+     ((int)(sc) > PSXKB_MOUSE_SC_BASE && (int)(sc) <= PSXKB_MOUSE_SC_BASE + 5)
+ 
++/* Wheel and relative-motion pseudo-scancodes, above the mouse-button block. */
++#define PSXKB_WHEELUP_SC    ((SDL_Scancode)520)
++#define PSXKB_WHEELDOWN_SC  ((SDL_Scancode)521)
++#define PSXKB_MOUSEX_NEG_SC ((SDL_Scancode)522)   /* mouse moved left  */
++#define PSXKB_MOUSEX_POS_SC ((SDL_Scancode)523)   /* mouse moved right */
++
++/* Relative-mouse turn tuning, in pixels per guest frame (~60 Hz). Motion is
++ * accumulated; the turn asserts as soon as motion is seen (small start/hold
++ * thresholds keep it responsive) and a modest decay releases it within a frame
++ * or two of the mouse stopping, so the view does not keep drifting. */
++#define PSXKB_TURN_START_PX 1.0f
++#define PSXKB_TURN_HOLD_PX  0.2f
++#define PSXKB_TURN_DECAY_PX 1.0f
++#define PSXKB_TURN_MAX_PX   4.0f
++#define PSXKB_WHEEL_PULSE   4
++
++static int   s_wheel_up = 0, s_wheel_down = 0;
++/* Written by the event loop, read by the game thread: atomics. */
++static int   s_wheel_claimed = 0, s_wheel_notches = 0;
++static uint16_t s_mod_press = 0, s_mod_release = 0;
++static uint8_t  s_debug_keys[SDL_NUM_SCANCODES];
++static float s_mouse_dx = 0.0f;
++static float s_mouse_dy = 0.0f;
++static float s_turn_accum = 0.0f;
++static int   s_turn_state = 0;   /* -1 left, +1 right, 0 none */
++
++void psx_keybinds_mouse_wheel(int dy) {
++    if (__atomic_load_n(&s_wheel_claimed, __ATOMIC_RELAXED)) {
++        __atomic_add_fetch(&s_wheel_notches, dy, __ATOMIC_RELAXED);
++        return;
++    }
++    if (dy > 0)      s_wheel_up = PSXKB_WHEEL_PULSE;
++    else if (dy < 0) s_wheel_down = PSXKB_WHEEL_PULSE;
++}
++
++void psx_keybinds_claim_wheel(int claimed) {
++    __atomic_store_n(&s_wheel_claimed, claimed ? 1 : 0, __ATOMIC_RELAXED);
++    if (claimed) s_wheel_up = s_wheel_down = 0;
++}
++
++int psx_keybinds_take_wheel_notches(void) {
++    return __atomic_exchange_n(&s_wheel_notches, 0, __ATOMIC_RELAXED);
++}
++
++void psx_keybinds_set_mod_buttons(uint16_t press, uint16_t release) {
++    s_mod_press = press;
++    s_mod_release = release;
++}
++
++void psx_keybinds_debug_key(int scancode, int down) {
++    if (scancode > 0 && scancode < SDL_NUM_SCANCODES)
++        s_debug_keys[scancode] = down ? 1u : 0u;
++}
++
++void psx_keybinds_mouse_motion(float dx) { s_mouse_dx += dx; }
++void psx_keybinds_mouse_motion_y(float dy) { s_mouse_dy += dy; }
++
++float psx_keybinds_take_mouse_dx(void) {
++    const float dx = s_mouse_dx;
++    s_mouse_dx = 0.0f;
++    return dx;
++}
++
++float psx_keybinds_take_mouse_dy(void) {
++    const float dy = s_mouse_dy;
++    s_mouse_dy = 0.0f;
++    return dy;
++}
++
++void psx_keybinds_frame_tick(void) {
++    if (s_wheel_up > 0)   s_wheel_up--;
++    if (s_wheel_down > 0) s_wheel_down--;
++    s_turn_accum += s_mouse_dx;
++    s_mouse_dx = 0.0f;
++    if (s_turn_accum > PSXKB_TURN_MAX_PX)  s_turn_accum = PSXKB_TURN_MAX_PX;
++    if (s_turn_accum < -PSXKB_TURN_MAX_PX) s_turn_accum = -PSXKB_TURN_MAX_PX;
++    const float start = s_turn_state ? PSXKB_TURN_HOLD_PX : PSXKB_TURN_START_PX;
++    if (s_turn_accum >= start) {
++        s_turn_state = 1;
++        s_turn_accum -= PSXKB_TURN_DECAY_PX;
++        if (s_turn_accum < 0.0f) s_turn_accum = 0.0f;
++    } else if (s_turn_accum <= -start) {
++        s_turn_state = -1;
++        s_turn_accum += PSXKB_TURN_DECAY_PX;
++        if (s_turn_accum > 0.0f) s_turn_accum = 0.0f;
++    } else {
++        s_turn_state = 0;
++        if (s_turn_accum > -0.5f && s_turn_accum < 0.5f) s_turn_accum = 0.0f;
++    }
++}
++
+ /* PSX pad word bits (active-low), standard DualShock layout. Matches the
+  * PAD_* masks in main.cpp / beetle_main.cpp. */
+ #define PSXKB_BIT_SELECT   (1u << 0)
+@@ -161,6 +252,15 @@ static SDL_Scancode name_to_scancode(const char *name) {
+     if (!strcmp(buf, "rmb") || !strcmp(buf, "mouse right"))  return PSXKB_MOUSE_SC(SDL_BUTTON_RIGHT);
+     if (!strcmp(buf, "mouse x1"))                            return PSXKB_MOUSE_SC(SDL_BUTTON_X1);
+     if (!strcmp(buf, "mouse x2"))                            return PSXKB_MOUSE_SC(SDL_BUTTON_X2);
++    /* Mouse wheel + relative motion pseudo-bindings. */
++    if (!strcmp(buf, "mousewheelup") || !strcmp(buf, "wheelup") ||
++        !strcmp(buf, "mwheelup"))                            return PSXKB_WHEELUP_SC;
++    if (!strcmp(buf, "mousewheeldown") || !strcmp(buf, "wheeldown") ||
++        !strcmp(buf, "mwheeldown"))                          return PSXKB_WHEELDOWN_SC;
++    if (!strcmp(buf, "mousex-") || !strcmp(buf, "mouseturnleft"))
++        return PSXKB_MOUSEX_NEG_SC;
++    if (!strcmp(buf, "mousex+") || !strcmp(buf, "mouseturnright"))
++        return PSXKB_MOUSEX_POS_SC;
+     return SDL_SCANCODE_UNKNOWN;
+ }
+ 
+@@ -171,6 +271,10 @@ static const char *scancode_to_name(SDL_Scancode sc) {
+             { "Mouse1", "Mouse2", "Mouse3", "Mouse4", "Mouse5" };
+         return mouse_names[(int)sc - PSXKB_MOUSE_SC_BASE - 1];
+     }
++    if (sc == PSXKB_WHEELUP_SC)    return "MouseWheelUp";
++    if (sc == PSXKB_WHEELDOWN_SC)  return "MouseWheelDown";
++    if (sc == PSXKB_MOUSEX_NEG_SC) return "MouseX-";
++    if (sc == PSXKB_MOUSEX_POS_SC) return "MouseX+";
+     const char *name = SDL_GetScancodeName(sc);
+     return (name && name[0]) ? name : "None";
+ }
+@@ -355,7 +459,12 @@ static int held_sc(const uint8_t *keys, SDL_Scancode sc) {
+         Uint32 m = SDL_GetMouseState(NULL, NULL);
+         return (m & SDL_BUTTON((int)sc - PSXKB_MOUSE_SC_BASE)) != 0;
+     }
+-    return sc != SDL_SCANCODE_UNKNOWN && (int)sc < SDL_NUM_SCANCODES && keys[sc];
++    if (sc == PSXKB_WHEELUP_SC)    return s_wheel_up > 0;
++    if (sc == PSXKB_WHEELDOWN_SC)  return s_wheel_down > 0;
++    if (sc == PSXKB_MOUSEX_NEG_SC) return s_turn_state < 0;
++    if (sc == PSXKB_MOUSEX_POS_SC) return s_turn_state > 0;
++    return sc != SDL_SCANCODE_UNKNOWN && (int)sc < SDL_NUM_SCANCODES &&
++           ((keys && keys[sc]) || s_debug_keys[sc]);
+ }
+ 
+ /* Is the input at button-def index i held for this player, via either its
+@@ -371,13 +480,20 @@ static int held(const uint8_t *keys, const PsxPlayerBinds *pb, int i) {
+ }
+ 
+ uint16_t psx_keybinds_pad_word(const uint8_t *keys, int player) {
+-    if (!keys || player < 1 || player > PSXKB_MAX_PLAYERS) return 0xFFFF;
++    /* keys may be NULL (headless / SDL video not initialized): keyboard
++     * sources then read as released, while the mouse pseudo-sources (wheel,
++     * relative turn, buttons) still resolve. */
++    if (player < 1 || player > PSXKB_MAX_PLAYERS) return 0xFFFF;
+     const PsxPlayerBinds *pb = player_binds_c(player);
+     uint16_t b = 0xFFFF;   /* active-low: all released */
+     for (int i = 0; i < PSXKB_N; i++) {
+         if (s_buttons[i].bit && held(keys, pb, i))
+             b &= (uint16_t)~s_buttons[i].bit;
+     }
++    if (player == 1) {
++        b |= s_mod_release;
++        b &= (uint16_t)~s_mod_press;
++    }
+     return b;
+ }
+ 

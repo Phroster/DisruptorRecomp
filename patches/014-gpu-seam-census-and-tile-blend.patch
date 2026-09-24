@@ -1,0 +1,346 @@
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 3f5c1b76..429ef6f1 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -366,6 +366,8 @@ void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
+ void gpu_ws_begin_linked_list(void);
+ void gpu_ws_end_linked_list(void);
+ void gpu_ws_prepass_linked_list(uint32_t start_addr);
++/* Records quads and their shared borders for the cross-tile blend (PSX_GL_TILE_BLEND). */
++void gpu_tile_blend_prepass(uint32_t start_addr);
+ void gpu_ws_validate_linked_list_header(uint32_t addr, uint32_t header);
+ void gpu_ws_validate_linked_list_node(uint32_t addr, uint32_t num_words);
+ void gpu_ws_restore_linked_list_rank(uint32_t rank);
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 01bd7c54..dc35f8aa 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5230,6 +5230,23 @@ static void handle_write_ram(int id, const char *json)
+  * the faithful way. So "enabled" alone tells you nothing — these counters are
+  * how you tell an engaged correction from an inert one. Both are free-running
+  * totals; sample twice and diff for a per-window rate. */
++/* {"cmd":"seam_dump","path":"..."}: arm the GPU seam census and write the last
++ * completed guest frame's triangle vertices (final 16.16 position, provenance,
++ * primitive, packet address) as CSV. tools/seam_census.py evaluates it. */
++static void handle_seam_dump(int id, const char *json)
++{
++    extern int gpu_seam_census_dump(const char *path);
++    char path[512];
++    if (!json_get_str(json, "path", path, sizeof(path))) { send_err(id, "missing path"); return; }
++    int n = gpu_seam_census_dump(path);
++    if (n < 0) { send_err(id, "cannot open path"); return; }
++    char line[96];
++    extern uint64_t g_tile_blend_quads, g_tile_blend_sides;
++    snprintf(line, sizeof(line), "{\"id\":%d,\"ok\":true,\"vertices\":%d,\"tile_quads\":%llu,\"tile_sides\":%llu}",
++             id, n, (unsigned long long)g_tile_blend_quads, (unsigned long long)g_tile_blend_sides);
++    debug_server_send_line(line);
++}
++
+ static void handle_geom_correction(int id, const char *json)
+ {
+     (void)json;
+@@ -13673,6 +13690,7 @@ static const CmdEntry s_commands[] = {
+     { "write_ram",         handle_write_ram },
+     { "gpu_state",         handle_gpu_state },
+     { "geom_correction",   handle_geom_correction },
++    { "seam_dump",         handle_seam_dump },
+     { "pgxp",              handle_pgxp },
+     { "ws_aspect_cone_site", handle_ws_aspect_cone_site },
+     { "ws_margin",         handle_ws_margin },
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index 3b426050..43787c4b 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -747,6 +747,7 @@ static void start_async_gpu_linked_list(void) {
+      * packets to GP0. The event-driven walker below performs every guest-visible
+      * header and payload read at its consumption boundary. */
+     gpu_ws_prepass_linked_list(start_addr);
++    gpu_tile_blend_prepass(start_addr);
+     dma_gpu_ll_start(&gpu_linked_list, start_addr, 0x40000u);
+     event_ring_record_aux(EV_DMA_SCHED, 2u, channels[2].chcr);
+     gpu_ot_stats.starts++;
+@@ -1460,6 +1461,7 @@ int dma_snapshot_read(const uint8_t *p, uint32_t len) {
+     if (gpu_linked_list.active) {
+         gpu_ws_begin_linked_list();
+         gpu_ws_prepass_linked_list(gpu_linked_list.start_addr);
++        gpu_tile_blend_prepass(gpu_linked_list.start_addr);
+         gpu_ws_restore_linked_list_rank(gpu_linked_list.empty_rank);
+     }
+     return 1;
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 761dcb06..2b667250 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3519,6 +3519,53 @@ uint32_t gpu_texture_correction_hits(void) {
+  * it, so shared edges between neighbouring triangles cannot disagree by more
+  * than the sub-pixel fraction. The integer delta folds in draw offsets and
+  * any widescreen adjustment already applied by the caller. */
++/* Seam census (diagnostic, off unless armed over TCP "seam_dump"): every
++ * triangle vertex of a guest frame with the position the renderer will use
++ * (16.16, draw offset applied) and where it came from. Two vertices that land
++ * within a pixel of each other without being bit-identical are a crack between
++ * polygons; the provenance pair says which path produced it. */
++#define SEAM_CENSUS_MAX 16384u
++typedef struct { int32_t x16, y16; uint32_t addr; uint32_t word; uint8_t src; uint8_t prim; } SeamVert;
++static SeamVert s_seam_cur[SEAM_CENSUS_MAX], s_seam_done[SEAM_CENSUS_MAX];
++static uint32_t s_seam_cur_n, s_seam_done_n, s_seam_done_frame;
++static uint32_t s_seam_frame = (uint32_t)-1;
++static int      s_seam_armed;
++
++static void seam_census_note(int32_t x16, int32_t y16, uint32_t addr, uint32_t word, int src) {
++    /* A guest frame is one render pass: from one screen clear (GP0 fill) to the
++     * next. The VBlank counter splits passes that straddle a VBlank. */
++    uint32_t f = (uint32_t)gp0_fill_count;
++    if (f != s_seam_frame) {
++        memcpy(s_seam_done, s_seam_cur, s_seam_cur_n * sizeof(SeamVert));
++        s_seam_done_n = s_seam_cur_n;
++        s_seam_done_frame = s_seam_frame;
++        s_seam_cur_n = 0;
++        s_seam_frame = f;
++    }
++    if (s_seam_cur_n < SEAM_CENSUS_MAX) {
++        SeamVert *v = &s_seam_cur[s_seam_cur_n++];
++        v->x16 = x16; v->y16 = y16; v->addr = addr; v->word = word;
++        v->src = (uint8_t)src; v->prim = (uint8_t)(gp0_cmd_buf[0] >> 24);
++    }
++}
++
++/* Arms the census and writes the last completed frame as CSV. Returns the
++ * number of vertices written, or -1 if the file could not be opened. */
++int gpu_seam_census_dump(const char *path) {
++    s_seam_armed = 1;
++    FILE *f = fopen(path, "wb");
++    if (!f) return -1;
++    fprintf(f, "frame,x16,y16,src,prim,addr,word\n");
++    for (uint32_t i = 0; i < s_seam_done_n; i++) {
++        const SeamVert *v = &s_seam_done[i];
++        fprintf(f, "%u,%d,%d,%u,%u,%08X,%08X\n", (unsigned)s_seam_done_frame,
++                (int)v->x16, (int)v->y16, (unsigned)v->src, (unsigned)v->prim,
++                (unsigned)v->addr, (unsigned)v->word);
++    }
++    fclose(f);
++    return (int)s_seam_done_n;
++}
++
+ static void prepare_precise_triangle(int i0, int i1, int i2,
+                                      const int32_t vx[3], const int32_t vy[3]) {
+     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+@@ -3538,11 +3585,18 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+                             : gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
+         int32_t px, py;
+         uint16_t sz;
+-        if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
+-                                    &px, &py, &sz) != PGXP_SRC_NATIVE)
++        int src = pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
++                                          &px, &py, &sz);
++        if (src != PGXP_SRC_NATIVE)
+             any_precise = 1;
+         fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
+         fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
++        if (s_seam_armed) {
++            if (src == PGXP_SRC_NATIVE)
++                seam_census_note(vx[i] * 65536, vy[i] * 65536, addr, word, src);
++            else
++                seam_census_note(fx[i], fy[i], addr, word, src);
++        }
+     }
+     if (!any_precise) {
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+@@ -4115,6 +4169,180 @@ static void gp0_exec_textured_quad(void) {
+ }
+ 
+ /* Execute shaded textured triangle (GP0 0x34-0x37) */
++/* Cross-tile blend (PSX_GL_TILE_BLEND=<band in texels>, 0/unset = off; OpenGL
++ * backend). Measured on Disruptor (tools/quad_edge_census.py): terrain is
++ * GP0 0x3C quads that each map a whole 32x32 tile; across a shared border the
++ * drawn colour jumps 10 (outdoor) to 27 (indoor) per channel against 5 to 14
++ * between neighbouring texels inside a tile, from both texture content and
++ * per-quad vertex lighting, and only a quarter of the outdoor borders join two
++ * quads with the same tile. Filtering ramps every other texel transition; the
++ * border is the one place it cannot, so it is the one hard line.
++ *
++ * A pre-pass over the display list records every opaque modulated 0x3C quad and
++ * indexes its four edges by their two vertex position words. When a quad is
++ * drawn, each border that lies on one side of its uv rectangle and is shared
++ * with another recorded quad is described to the renderer: the neighbour's
++ * texture page, CLUT, depth, texel limits, its uv and vertex colours at the two
++ * shared corners. The fragment shader mixes the neighbour's edge colour in over
++ * the band. Host render path only. */
++#define TILE_QUADS_MAX 4096u
++#define TILE_EDGE_SLOTS 32768u              /* power of two */
++typedef struct {
++    uint32_t vw[4];                          /* vertex position words (11-bit x/y) */
++    uint8_t  u[4], v[4];
++    uint32_t col[4];
++    uint16_t tpx, tpy, clx, cly;
++    uint8_t  depth;
++} TileQuad;
++typedef struct { uint32_t a, b; uint16_t q[2]; uint8_t n; } TileEdge;
++static TileQuad s_tq[TILE_QUADS_MAX];
++static uint32_t s_tq_n;
++static TileEdge s_te[TILE_EDGE_SLOTS];
++static uint32_t s_te_used;
++static float    s_tile_band = -1.0f;
++uint64_t        g_tile_blend_quads, g_tile_blend_sides;   /* diagnostic: quads drawn / borders described */
++
++extern void gl_renderer_set_quad_neighbours(const float *rec);
++
++static float tile_blend_band(void) {
++    if (s_tile_band < 0.0f) {
++        const char *e = getenv("PSX_GL_TILE_BLEND");
++        float v = (e && *e) ? (float)atof(e) : 0.0f;
++        s_tile_band = (v > 0.0f && v <= 16.0f) ? v : 0.0f;
++    }
++    return s_tile_band;
++}
++
++static TileEdge *tile_edge(uint32_t va, uint32_t vb, int create) {
++    uint32_t a = va < vb ? va : vb, b = va < vb ? vb : va;
++    if (a == b) return NULL;
++    uint32_t h = ((a * 2654435761u) ^ (b * 40503u)) >> 17;         /* 15 bits */
++    for (uint32_t probe = 0; probe < 64u; probe++) {
++        TileEdge *e = &s_te[(h + probe) & (TILE_EDGE_SLOTS - 1u)];
++        if (e->n && e->a == a && e->b == b) return e;
++        if (!e->n) {
++            if (!create || s_te_used >= TILE_EDGE_SLOTS / 2u) return NULL;
++            e->a = a; e->b = b; s_te_used++;
++            return e;
++        }
++    }
++    return NULL;
++}
++
++static const int TILE_EDGE_V[4][2] = { {0, 1}, {1, 3}, {3, 2}, {2, 0} };   /* quad order is a Z */
++
++static void tile_quad_from_words(TileQuad *q, const uint32_t *w) {
++    for (int i = 0; i < 4; i++) {
++        q->col[i] = w[i * 3] & 0xFFFFFFu;
++        q->vw[i]  = w[i * 3 + 1] & 0x07FF07FFu;
++        q->u[i]   = (uint8_t)(w[i * 3 + 2] & 0xFFu);
++        q->v[i]   = (uint8_t)((w[i * 3 + 2] >> 8) & 0xFFu);
++    }
++    uint32_t clut = (w[2] >> 16) & 0xFFFFu, tp = (w[5] >> 16) & 0x1FFu;
++    q->clx = (uint16_t)((clut & 0x3Fu) * 16u);
++    q->cly = (uint16_t)((clut >> 6) & 0x1FFu);
++    q->tpx = (uint16_t)((tp & 0xFu) * 64u);
++    q->tpy = (uint16_t)(((tp >> 4) & 1u) * 256u);
++    q->depth = (uint8_t)(((tp >> 7) & 3u) > 2u ? 2u : ((tp >> 7) & 3u));
++}
++
++void gpu_tile_blend_prepass(uint32_t start_addr) {
++    if (tile_blend_band() <= 0.0f || gr_backend() != GR_BACKEND_OPENGL) return;
++    if (s_te_used) { memset(s_te, 0, sizeof(s_te)); s_te_used = 0; }
++    s_tq_n = 0;
++    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
++    for (uint32_t safety = 0; safety < 0x40000u; safety++) {
++        uint32_t header = psx_read_word(addr);
++        uint32_t num_words = (header >> 24) & 0xFFu;
++        uint32_t word_addr = psx_mod_gpu_dma_resolve_address(addr + 4u);
++        uint32_t offset = 0;
++        while (offset < num_words) {
++            uint32_t first = psx_read_word(psx_mod_gpu_dma_resolve_address(word_addr + offset * 4u));
++            uint8_t op = (uint8_t)(first >> 24);
++            int count = gp0_command_word_count(op);
++            if (count <= 0 || offset + (uint32_t)count > num_words) break;
++            if (op >= 0xA0u && op <= 0xBFu) break;
++            if (op == 0x3Cu && count == 12 && s_tq_n < TILE_QUADS_MAX) {
++                uint32_t w[12];
++                for (int i = 0; i < 12; i++)
++                    w[i] = psx_read_word(psx_mod_gpu_dma_resolve_address(
++                        word_addr + (offset + (uint32_t)i) * 4u));
++                TileQuad *q = &s_tq[s_tq_n];
++                tile_quad_from_words(q, w);
++                for (int e = 0; e < 4; e++) {
++                    TileEdge *te = tile_edge(q->vw[TILE_EDGE_V[e][0]], q->vw[TILE_EDGE_V[e][1]], 1);
++                    if (te && te->n < 2) te->q[te->n++] = (uint16_t)s_tq_n;
++                    else if (te) te->n = 3;              /* three or more users: not a plain border */
++                }
++                s_tq_n++;
++            }
++            offset += (uint32_t)count;
++        }
++        uint32_t next = header & 0xFFFFFFu;
++        if (next == 0xFFFFFFu) break;
++        addr = psx_mod_gpu_dma_resolve_address(next);
++    }
++}
++
++/* Describe the borders of the 0x3C quad in gp0_cmd_buf to the renderer. */
++static void tile_blend_describe(void) {
++    float band = tile_blend_band();
++    if (band <= 0.0f || !s_te_used || gr_backend() != GR_BACKEND_OPENGL) return;
++    TileQuad A;
++    tile_quad_from_words(&A, gp0_cmd_buf);
++    int umin = 255, umax = 0, vmin = 255, vmax = 0;
++    for (int i = 0; i < 4; i++) {
++        if (A.u[i] < umin) umin = A.u[i]; if (A.u[i] > umax) umax = A.u[i];
++        if (A.v[i] < vmin) vmin = A.v[i]; if (A.v[i] > vmax) vmax = A.v[i];
++    }
++    if (umin == umax || vmin == vmax) return;
++    g_tile_blend_quads++;
++    float rec[96];
++    memset(rec, 0, sizeof(rec));
++    int any = 0;
++    for (int e = 0; e < 4; e++) {
++        int ip = TILE_EDGE_V[e][0], iq = TILE_EDGE_V[e][1];
++        int side;
++        float a_p, a_q, border;
++        if (A.u[ip] == A.u[iq] && (A.u[ip] == umin || A.u[ip] == umax)) {
++            side = A.u[ip] == umin ? 0 : 1; a_p = A.v[ip]; a_q = A.v[iq]; border = A.u[ip];
++        } else if (A.v[ip] == A.v[iq] && (A.v[ip] == vmin || A.v[ip] == vmax)) {
++            side = A.v[ip] == vmin ? 2 : 3; a_p = A.u[ip]; a_q = A.u[iq]; border = A.v[ip];
++        } else continue;
++        const TileEdge *te = tile_edge(A.vw[ip], A.vw[iq], 0);
++        if (!te || te->n != 2) continue;
++        const TileQuad *B = NULL;
++        for (int k = 0; k < 2; k++) {
++            const TileQuad *c = &s_tq[te->q[k]];
++            if (memcmp(c->vw, A.vw, sizeof(A.vw)) != 0 || memcmp(c->u, A.u, 4) != 0) B = c;
++        }
++        if (!B) continue;
++        int jp = -1, jq = -1;
++        for (int j = 0; j < 4; j++) {
++            if (B->vw[j] == A.vw[ip] && jp < 0) jp = j;
++            else if (B->vw[j] == A.vw[iq] && jq < 0) jq = j;
++        }
++        if (jp < 0 || jq < 0) continue;
++        int bumin = 255, bumax = 0, bvmin = 255, bvmax = 0;
++        for (int j = 0; j < 4; j++) {
++            if (B->u[j] < bumin) bumin = B->u[j]; if (B->u[j] > bumax) bumax = B->u[j];
++            if (B->v[j] < bvmin) bvmin = B->v[j]; if (B->v[j] > bvmax) bvmax = B->v[j];
++        }
++        float *r = &rec[side * 24];
++        r[0] = B->tpx; r[1] = B->tpy; r[2] = B->clx; r[3] = B->cly;
++        r[4] = B->u[jp]; r[5] = B->v[jp]; r[6] = B->u[jq]; r[7] = B->v[jq];
++        r[8] = 1.0f; r[9] = B->depth; r[10] = a_p; r[11] = a_q;
++        r[12] = (B->col[jp] & 0xFF) / 255.0f; r[13] = ((B->col[jp] >> 8) & 0xFF) / 255.0f;
++        r[14] = ((B->col[jp] >> 16) & 0xFF) / 255.0f; r[15] = border;
++        r[16] = (B->col[jq] & 0xFF) / 255.0f; r[17] = ((B->col[jq] >> 8) & 0xFF) / 255.0f;
++        r[18] = ((B->col[jq] >> 16) & 0xFF) / 255.0f; r[19] = band;
++        r[20] = (float)bumin; r[21] = (float)bvmin; r[22] = (float)bumax; r[23] = (float)bvmax;
++        any = 1;
++        g_tile_blend_sides++;
++    }
++    if (any) gl_renderer_set_quad_neighbours(rec);
++}
++
+ static void gp0_exec_shaded_textured_tri(void) {
+     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
+@@ -4217,6 +4445,7 @@ static void gp0_exec_shaded_textured_quad(void) {
+     if (draw_area_out_bbox(vx, vy, 4)) return;
+ 
+     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
++    if (!semi_trans && !raw_texture) tile_blend_describe();
+     if (!rej_a) {
+         int32_t tx[3] = { vx[0], vx[1], vx[2] };
+         int32_t ty[3] = { vy[0], vy[1], vy[2] };
+@@ -4237,6 +4466,8 @@ static void gp0_exec_shaded_textured_quad(void) {
+                                          vx[3], vy[3], u[3], v[3], c[3],
+                                          clut_x, clut_y, tpage, raw_texture);
+     }
++    if (tile_blend_band() > 0.0f && gr_backend() == GR_BACKEND_OPENGL)
++        gl_renderer_set_quad_neighbours(NULL);
+ }
+ 
+ /* Execute mono line (GP0 0x40-0x47) — Bresenham */

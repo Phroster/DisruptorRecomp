@@ -1,0 +1,487 @@
+diff --git a/runtime/include/pgxp.h b/runtime/include/pgxp.h
+index aa55b3aa..68640c23 100644
+--- a/runtime/include/pgxp.h
++++ b/runtime/include/pgxp.h
+@@ -86,6 +86,24 @@ enum {
+  * coordinate space as the packet halves); *sz is the projected depth or 0.
+  * Safeguards applied here: the integer part must match the native parse
+  * (truncation agreement) and the tolerance clamp. */
++/* Scalar tier: exact trig for a guest sine/cosine table (count s16 entries of
++ * round(scale*sin/cos(2*pi*i/count)), two bytes apart); entry frac_index is read
++ * as the angle frac_index + frac. sin_base 0 / count 0 = none. */
++void pgxp_set_trig_tables(uint32_t sin_base, uint32_t cos_base, uint32_t count,
++                          double scale, int32_t frac_index, double frac);
++/* Scalar tier: a guest reciprocal table, `count` u16 entries of
++ * floor(numerator / i), two bytes apart. A load indexed by a register that
++ * carries an exact value yields numerator / that value. base 0 = none. */
++void pgxp_set_recip_table(uint32_t base, uint32_t count, double numerator);
++/* Scalar tier: the guest word at `addr` is a coarser copy of the word at
++ * `fine_addr` (addr = fine >> shift, e.g. a camera position kept at two
++ * resolutions). A load of `addr` whose value agrees yields fine / 2^shift.
++ * `read_word` reads guest memory. Up to 4 slots; read_word NULL clears one. */
++void pgxp_set_word_alias(int slot, uint32_t addr, uint32_t fine_addr, uint32_t shift,
++                         uint32_t (*read_word)(uint32_t addr));
++/* Nonzero when the packet vertex word carries a CPU-projected precise position. */
++int pgxp_peek_scalar_vertex(uint32_t addr, uint32_t packet_word);
++
+ int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                             int32_t int_x, int32_t int_y,
+                             int32_t *x16, int32_t *y16, uint16_t *sz);
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 2b667250..334c553f 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -4121,7 +4121,18 @@ static void gp0_exec_textured_quad(void) {
+ 
+     setup_textured_draw(color24, semi_trans, raw_texture);
+ 
+-    if (vy[0] == vy[1] && vy[2] == vy[3] &&
++    /* A screen-aligned quad normally takes the integer rect path. One whose
++     * corners the CPU projected with PGXP scalar tracking (billboard sprites)
++     * has sub-pixel corners and must go through the triangle path to use them. */
++    int scalar_sprite = gte_geometry_correction_enabled() &&
++                        gp0_cmd_source_addr != 0xFFFFFFFFu;
++    /* All four corners or none: a sprite with some corners precise and some on
++     * whole pixels would be skewed by the difference. */
++    for (int k = 1; scalar_sprite && k <= 7; k += 2)
++        scalar_sprite = pgxp_peek_scalar_vertex(gp0_cmd_source_addr + (uint32_t)k * 4u,
++                                                gp0_cmd_buf[k]);
++    if (!scalar_sprite &&
++        vy[0] == vy[1] && vy[2] == vy[3] &&
+         vx[0] == vx[2] && vx[1] == vx[3] &&
+         u[0] == u[2] && u[1] == u[3] &&
+         v[0] == v[1] && v[2] == v[3]) {
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 52c57bca..84579570 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -35,6 +35,7 @@
+ #include "pgxp_hooks.h"
+ #include "cpu_state.h"
+ 
++#include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -51,6 +52,10 @@ enum {
+     PGXP_F_VY = 1u << 1,   /* high half (screen Y) tracked                    */
+     PGXP_F_VZ = 1u << 2,   /* projected depth rode along intact               */
+     PGXP_F_VXY = PGXP_F_VX | PGXP_F_VY,
++    /* Scalar tier (see "Scalar tracking" below). */
++    PGXP_F_SC = 1u << 3,   /* `sc` is the exact real value of this word       */
++    PGXP_F_RX = 1u << 4,   /* X half came from a scalar: relaxed agreement    */
++    PGXP_F_RY = 1u << 5,   /* Y half came from a scalar: relaxed agreement    */
+ };
+ 
+ struct PGXPValue {
+@@ -59,6 +64,8 @@ struct PGXPValue {
+     uint16_t flags;
+     uint32_t value;      /* the guest word this shadow describes              */
+     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
++    double   sc;         /* PGXP_F_SC: unrounded value of `value` as a signed
++                            integer (what the guest's integer maths truncated) */
+ };
+ 
+ #define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
+@@ -170,9 +177,10 @@ static inline void pv_validate(PGXPValue *pv, uint32_t actual) {
+     if (pv->gen != s_gen) return;
+     uint32_t diff = pv->value ^ actual;
+     if ((pv->flags & PGXP_F_VX) && (diff & 0x0000FFFFu))
+-        pv->flags &= (uint16_t)~(PGXP_F_VX | PGXP_F_VZ);
++        pv->flags &= (uint16_t)~(PGXP_F_VX | PGXP_F_VZ | PGXP_F_RX);
+     if ((pv->flags & PGXP_F_VY) && (diff & 0xFFFF0000u))
+-        pv->flags &= (uint16_t)~(PGXP_F_VY | PGXP_F_VZ);
++        pv->flags &= (uint16_t)~(PGXP_F_VY | PGXP_F_VZ | PGXP_F_RY);
++    if (diff) pv->flags &= (uint16_t)~PGXP_F_SC;
+     pv->value = actual;
+ }
+ 
+@@ -199,6 +207,159 @@ static inline uint32_t f_shamt(uint32_t i) { return (i >> 6) & 31u; }
+ static inline uint32_t f_funct(uint32_t i) { return i & 63u; }
+ static inline int32_t  f_simm(uint32_t i)  { return (int32_t)(int16_t)(i & 0xFFFFu); }
+ 
++/* ------------------------------------------------------------------------- */
++/* Scalar tracking (cpu-mode tier 3, PSX_PGXP_SCALAR=0 disables)              */
++/* ------------------------------------------------------------------------- */
++/* Some engines project part of their scene on the CPU instead of the GTE:
++ * rotate with a Q8 sine table, >> 8, multiply by the projection distance,
++ * integer-divide by depth, then store x and y into the packet with SH. Every
++ * step truncates, so such sprites land on whole pixels a pixel or so away from
++ * where GTE-projected geometry puts the same point, and visibly dance against
++ * it when the view moves. A shadow can therefore also carry the exact real
++ * value (`sc`) of the integer a register holds. It is created by a load from a
++ * registered trig table (the exact sine instead of its rounded Q8 entry) or
++ * combines with untracked integers, which are exact by themselves, through
++ * add / sub / constant shifts / mult / div. An SH of such a register into a
++ * packet turns it into that half's sub-pixel coordinate. The integer the guest
++ * computed is never changed; the consumer accepts a scalar-derived half when
++ * it lies within 2 px of the packet's integer (the truncations it replaces add
++ * up to about that), instead of demanding an identical integer part. */
++static int s_scalar = -1;
++static inline int scalar_on(void) {
++    if (s_scalar < 0) {
++        const char *e = std::getenv("PSX_PGXP_SCALAR");
++        s_scalar = (e && e[0] == '0') ? 0 : 1;
++    }
++    return s_scalar && s_cpu_mode;
++}
++
++static inline int sc_tracked(uint32_t reg, uint32_t actual) {
++    if (reg == 0) return 0;
++    const PGXPValue *pv = &s_gpr[reg];
++    return pv->gen == s_gen && (pv->flags & PGXP_F_SC) && pv->value == actual;
++}
++static inline double sc_of(uint32_t reg, uint32_t actual, int is_unsigned) {
++    if (sc_tracked(reg, actual)) return s_gpr[reg].sc;
++    return is_unsigned ? (double)actual : (double)(int32_t)actual;
++}
++static inline void sc_attach(PGXPValue *pv, double v) {
++    if (!(std::fabs(v) < 9.0e15)) return;       /* also rejects NaN/inf      */
++    pv->sc = v;
++    pv->flags |= PGXP_F_SC;
++}
++
++/* Exact trig for a guest sine/cosine table: `count` s16 entries of
++ * round(scale * sin/cos(2*pi*i/count)); entry frac_index is to be read as the
++ * angle frac_index + frac (a port's sub-step view angle). base 0 = none. */
++static struct {
++    uint32_t sin_base, cos_base, count;
++    double   scale, frac;
++    int32_t  frac_index;
++} s_trig;
++
++extern "C" void pgxp_set_trig_tables(uint32_t sin_base, uint32_t cos_base,
++                                     uint32_t count, double scale,
++                                     int32_t frac_index, double frac) {
++    s_trig.sin_base = sin_base & 0x1FFFFFu;
++    s_trig.cos_base = cos_base & 0x1FFFFFu;
++    s_trig.count = count;
++    s_trig.scale = scale;
++    s_trig.frac_index = frac_index;
++    s_trig.frac = frac;
++}
++
++/* Exact reciprocal for a guest table of floor(numerator / i): engines size
++ * their sprites with it (w = W * recip[z] >> 16), which makes the size step in
++ * whole pixels and the sprite's centre hop half a pixel with every step. */
++static struct {
++    uint32_t base, count;
++    double   numerator;
++} s_recip;
++
++extern "C" void pgxp_set_recip_table(uint32_t base, uint32_t count, double numerator) {
++    s_recip.base = base & 0x1FFFFFu;
++    s_recip.count = count;
++    s_recip.numerator = numerator;
++}
++
++/* `instr` is the load; its base register must carry the exact index. */
++static inline int recip_scalar(uint32_t instr, uint32_t addr, uint32_t value, double *out) {
++    if (!s_recip.count) return 0;
++    uint32_t a = addr & 0x1FFFFFu;
++    if (a < s_recip.base || a >= s_recip.base + 2u * s_recip.count || ((a - s_recip.base) & 1u))
++        return 0;
++    uint32_t rs = f_rs(instr);
++    uint32_t base_val = addr - (uint32_t)f_simm(instr);
++    if (!sc_tracked(rs, base_val)) return 0;
++    /* the register is table address + 2 * index: only its distance from the
++     * integer it holds matters, whatever form the address constant has */
++    double idx = (double)((a - s_recip.base) >> 1) +
++                 (s_gpr[rs].sc - (double)(int32_t)base_val) * 0.5;
++    double idx_int = (double)((a - s_recip.base) >> 1);
++    /* the entry must be what the table formula says, and the exact index must
++     * be the one the guest's truncations arrived at */
++    if (idx_int < 1.0 || std::fabs(s_recip.numerator / idx_int - (double)value) > 1.0) return 0;
++    /* (rounded Q8 trig times the distance, >> 8, a camera in whole units: the
++     * integer depth is off by about 1 + 1 % of itself) */
++    if (!(idx > 0.5) || std::fabs(idx - idx_int) > 2.0 + idx_int * 0.02) return 0;
++    *out = s_recip.numerator / idx;
++    return 1;
++}
++
++/* A word that is a coarser copy of another word (see pgxp.h). */
++static struct {
++    uint32_t addr, fine_addr, shift;
++    uint32_t (*read_word)(uint32_t);
++} s_alias[4];
++static uint32_t s_alias_lo = 1u, s_alias_hi = 0u;   /* address window of all slots (empty) */
++
++extern "C" void pgxp_set_word_alias(int slot, uint32_t addr, uint32_t fine_addr,
++                                    uint32_t shift, uint32_t (*read_word)(uint32_t)) {
++    if (slot < 0 || slot >= 4 || shift > 15u) return;
++    s_alias[slot].addr = addr & 0x1FFFFCu;
++    s_alias[slot].fine_addr = fine_addr;
++    s_alias[slot].shift = shift;
++    s_alias[slot].read_word = read_word;
++    s_alias_lo = 1u; s_alias_hi = 0u;
++    for (int i = 0; i < 4; i++) {
++        if (!s_alias[i].read_word) continue;
++        if (s_alias_lo > s_alias_hi) s_alias_lo = s_alias_hi = s_alias[i].addr;
++        if (s_alias[i].addr < s_alias_lo) s_alias_lo = s_alias[i].addr;
++        if (s_alias[i].addr > s_alias_hi) s_alias_hi = s_alias[i].addr;
++    }
++}
++
++static inline int alias_scalar(uint32_t addr, uint32_t value, double *out) {
++    uint32_t a = addr & 0x1FFFFCu;
++    if (a - s_alias_lo > s_alias_hi - s_alias_lo || s_alias_lo > s_alias_hi) return 0;   /* every LW passes here */
++    for (int i = 0; i < 4; i++) {
++        if (!s_alias[i].read_word || s_alias[i].addr != a) continue;
++        int32_t fine = (int32_t)s_alias[i].read_word(s_alias[i].fine_addr);
++        if ((uint32_t)(fine >> s_alias[i].shift) != value) return 0;   /* not in step */
++        *out = (double)fine / (double)(1u << s_alias[i].shift);
++        return 1;
++    }
++    return 0;
++}
++
++static inline int trig_scalar(uint32_t addr, double *out) {
++    if (!s_trig.count) return 0;
++    uint32_t a = addr & 0x1FFFFFu;
++    int is_cos;
++    uint32_t off;
++    if (a >= s_trig.sin_base && a < s_trig.sin_base + 2u * s_trig.count) {
++        is_cos = 0; off = a - s_trig.sin_base;
++    } else if (a >= s_trig.cos_base && a < s_trig.cos_base + 2u * s_trig.count) {
++        is_cos = 1; off = a - s_trig.cos_base;
++    } else return 0;
++    if (off & 1u) return 0;
++    int32_t i = (int32_t)(off >> 1);
++    double ang = ((double)i + (i == s_trig.frac_index ? s_trig.frac : 0.0)) *
++                 (6.283185307179586 / (double)s_trig.count);
++    *out = s_trig.scale * (is_cos ? std::cos(ang) : std::sin(ang));
++    return 1;
++}
++
+ /* ------------------------------------------------------------------------- */
+ /* Memory-mode hooks: loads / stores                                          */
+ /* ------------------------------------------------------------------------- */
+@@ -220,11 +381,18 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+         } else {
+             pv_reset(dst, value);
+         }
++        if (scalar_on()) {
++            double av;
++            if (alias_scalar(addr, value, &av)) sc_attach(dst, av);
++        }
+         return;
+     }
+     case 0x21:                                 /* LH                          */
+     case 0x25: {                               /* LHU                         */
+         PGXPValue *src = pgxp_ptr(addr);
++        /* before dst is reset: the base register may be the destination */
++        double rv = 0.0;
++        int have_recip = scalar_on() && recip_scalar(instr, addr, value & 0xFFFFu, &rv);
+         int hi_half = (addr >> 1) & 1;
+         pv_reset(dst, value);
+         /* The high half of the extended GPR is a known-exact constant
+@@ -239,8 +407,26 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+             if ((src->flags & want) && ((src->value ^ actual_half) & mask) == 0) {
+                 dst->x16 = hi_half ? src->y16 : src->x16;
+                 dst->flags |= PGXP_F_VX;
++                /* a scalar-derived half stays "relaxed" on its way through a
++                 * register (the guest re-reads a corner and stores it again) */
++                if (src->flags & (hi_half ? PGXP_F_RY : PGXP_F_RX)) {
++                    dst->flags |= PGXP_F_RX;
++                    /* ...and is a scalar again: engines park projected sprite
++                     * coordinates in a list of halves and build the packet from
++                     * it later (x1 = x + w - 1); 16.16 loses nothing here. */
++                    if (scalar_on())
++                        sc_attach(dst, (double)dst->x16 / 65536.0);
++                }
+             }
+         }
++        if (scalar_on()) {
++            double tv;
++            /* believed only while it still rounds to the entry the guest read */
++            if (trig_scalar(addr, &tv) &&
++                std::fabs(tv - (double)(int32_t)value) <= 2.0)
++                sc_attach(dst, tv);
++            if (have_recip) sc_attach(dst, rv);
++        }
+         return;
+     }
+     default:                                   /* LB/LBU/LWL/LWR: untrackable */
+@@ -277,12 +463,22 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+          * half-write — the vertex it described no longer exists whole. */
+         if (hi_half) dst->value = (dst->value & 0x0000FFFFu) | (half << 16);
+         else         dst->value = (dst->value & 0xFFFF0000u) | half;
+-        dst->flags &= (uint16_t)~((hi_half ? PGXP_F_VY : PGXP_F_VX) | PGXP_F_VZ);
++        dst->flags &= (uint16_t)~((hi_half ? (PGXP_F_VY | PGXP_F_RY)
++                                           : (PGXP_F_VX | PGXP_F_RX)) |
++                                  PGXP_F_VZ | PGXP_F_SC);
+         dst->z = 0;
+         if (src && src->gen == s_gen && (src->flags & PGXP_F_VX) &&
+             ((src->value ^ value) & 0xFFFFu) == 0) {
+             if (hi_half) { dst->y16 = src->x16; dst->flags |= PGXP_F_VY; }
+             else         { dst->x16 = src->x16; dst->flags |= PGXP_F_VX; }
++            if (src->flags & PGXP_F_RX)
++                dst->flags |= (uint16_t)(hi_half ? PGXP_F_RY : PGXP_F_RX);
++        }
++        if (scalar_on() && src && src->gen == s_gen && (src->flags & PGXP_F_SC) &&
++            src->value == value && std::fabs(src->sc) < 16000.0) {
++            int32_t p16 = (int32_t)std::lround(src->sc * 65536.0);
++            if (hi_half) { dst->y16 = p16; dst->flags |= PGXP_F_VY | PGXP_F_RY; }
++            else         { dst->x16 = p16; dst->flags |= PGXP_F_VX | PGXP_F_RX; }
+         }
+         return;
+     }
+@@ -416,10 +612,57 @@ static inline int halves_independent(uint32_t a, uint32_t b, uint32_t r, int sub
+            ((lo >> 16) == 0);                  /* no carry/borrow out of low  */
+ }
+ 
++static void pgxp_alu_impl(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2);
++
+ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+                              uint32_t result, uint32_t s1, uint32_t s2) {
+     (void)cpu;
+     if (!g_pgxp_active) return;
++    /* Scalar result first: the destination may be one of the sources. */
++    int have = 0;
++    double r = 0.0;
++    uint32_t dreg = 0;
++    if (scalar_on()) {
++        uint32_t op = f_op(instr);
++        if (op == 0) {
++            uint32_t rs = f_rs(instr), rt = f_rt(instr), fn = f_funct(instr);
++            dreg = f_rd(instr);
++            if (fn >= 0x20 && fn <= 0x23) {            /* ADD/ADDU/SUB/SUBU */
++                if (sc_tracked(rs, s1) || sc_tracked(rt, s2)) {
++                    double a = sc_of(rs, s1, 0), b = sc_of(rt, s2, 0);
++                    r = (fn >= 0x22) ? a - b : a + b;
++                    have = 1;
++                }
++            } else if (fn == 0x00 || fn == 0x02 || fn == 0x03) {   /* SLL/SRL/SRA */
++                uint32_t sh = f_shamt(instr);
++                /* s1 is the shifted register's value. A left shift that pushes
++                 * the value out of the word (the x/y repack, sll 16 of a
++                 * negative half) is not a multiplication. */
++                if (sc_tracked(rt, s1) &&
++                    (fn != 0x02 || (int32_t)s1 >= 0)) {
++                    double a = s_gpr[rt].sc;
++                    r = (fn == 0x00) ? a * (double)(1u << sh) : a / (double)(1u << sh);
++                    have = (fn != 0x00) ||
++                           (int64_t)(int32_t)s1 * ((int64_t)1 << sh) == (int64_t)(int32_t)result;
++                }
++            }
++        } else if (op == 0x08 || op == 0x09) {         /* ADDI / ADDIU      */
++            uint32_t rs = f_rs(instr);
++            dreg = f_rt(instr);
++            if (f_simm(instr) != 0 && sc_tracked(rs, s1)) {
++                r = s_gpr[rs].sc + (double)f_simm(instr);
++                have = 1;
++            }
++        }
++    }
++    pgxp_alu_impl(instr, result, s1, s2);
++    if (have && dreg != 0) {
++        PGXPValue *d = &s_gpr[dreg];
++        if (d->gen == s_gen && d->value == result) sc_attach(d, r);
++    }
++}
++
++static void pgxp_alu_impl(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2) {
+ 
+     uint32_t op = f_op(instr);
+     uint32_t dst_reg;
+@@ -623,12 +866,25 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+ extern "C" void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr,
+                                 uint32_t hi, uint32_t lo,
+                                 uint32_t s1, uint32_t s2) {
+-    (void)cpu; (void)instr; (void)s1; (void)s2;
++    (void)cpu;
+     if (!g_pgxp_active) return;
++    int have = 0;
++    double r = 0.0;
++    if (scalar_on() && f_op(instr) == 0) {
++        uint32_t rs = f_rs(instr), rt = f_rt(instr), fn = f_funct(instr);
++        if (fn >= 0x18 && fn <= 0x1B && (sc_tracked(rs, s1) || sc_tracked(rt, s2))) {
++            int uns = (fn & 1u) != 0;
++            double a = sc_of(rs, s1, uns), b = sc_of(rt, s2, uns);
++            if (fn <= 0x19) { r = a * b; have = 1; }
++            else if (s2 != 0 && std::fabs(b) > 1e-9) { r = a / b; have = 1; }
++        }
++    }
+     /* Products/quotients of screen coordinates are not screen coordinates:
+      * record the results as known-but-imprecise so MFHI/MFLO stay honest. */
+     pv_reset(&s_gpr[PGXP_REG_HI], hi);
+     pv_reset(&s_gpr[PGXP_REG_LO], lo);
++    /* ...but the exact quotient/product of tracked scalars rides along in LO. */
++    if (have) sc_attach(&s_gpr[PGXP_REG_LO], r);
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -683,6 +939,35 @@ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
+ /* GPU consumer                                                               */
+ /* ------------------------------------------------------------------------- */
+ 
++/* How far a scalar-derived half may sit from the packet's integer. The integer
++ * is the end of a chain of truncations (Q8 trig, >> 8, a camera position in
++ * whole units, integer divides, a floor(65536/z) size): for a near sprite that
++ * adds up to several pixels. The word itself is already matched by value; this
++ * only has to reject a chain that went wrong altogether. A rejected corner
++ * sends the whole sprite back to whole pixels for that frame, a visible hop,
++ * so the limit is generous. */
++static const int32_t kScalarRelax16 = 16 << 16;
++
++/* Does this packet vertex word carry a scalar-derived (CPU-projected) precise
++ * position? Lets the GPU keep such a quad off its integer-only rect path. */
++extern "C" int pgxp_peek_scalar_vertex(uint32_t addr, uint32_t packet_word) {
++    if (!s_enabled || addr == 0xFFFFFFFFu) return 0;
++    const PGXPValue *pv = pgxp_ptr(addr);
++    if (!pv || pv->gen != s_gen || pv->value != packet_word ||
++        (pv->flags & PGXP_F_VXY) != PGXP_F_VXY ||
++        (pv->flags & (PGXP_F_RX | PGXP_F_RY)) == 0)
++        return 0;
++    /* the same agreement test pgxp_get_precise_vertex will apply */
++    int32_t ix = ((int32_t)(packet_word << 21)) >> 21;
++    int32_t iy = ((int32_t)((packet_word >> 16) << 21)) >> 21;
++    const int32_t lim = kScalarRelax16 + 0x8000;
++    int ok_x = (pv->flags & PGXP_F_RX) ? (std::abs(pv->x16 - ((ix << 16) + 0x8000)) <= lim)
++                                       : ((pv->x16 >> 16) == ix);
++    int ok_y = (pv->flags & PGXP_F_RY) ? (std::abs(pv->y16 - ((iy << 16) + 0x8000)) <= lim)
++                                       : ((pv->y16 >> 16) == iy);
++    return ok_x && ok_y;
++}
++
+ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                                        int32_t int_x, int32_t int_y,
+                                        int32_t *x16, int32_t *y16,
+@@ -691,6 +976,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+ 
+     int32_t px = 0, py = 0;
+     uint16_t pz = 0;
++    uint16_t pflags = 0;
+     int have = 0;
+ 
+     if (s_enabled && addr != 0xFFFFFFFFu) {
+@@ -701,6 +987,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                 px = pv->x16;
+                 py = pv->y16;
+                 pz = (pv->flags & PGXP_F_VZ) ? pv->z : 0;
++                pflags = pv->flags;
+                 have = PGXP_SRC_DATAFLOW;
+             } else {
+                 s_stats.value_mismatch++;
+@@ -717,10 +1004,19 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+         /* Truncation agreement: the GPU parsed 11-bit integers out of the
+          * packet; a precise position whose integer part disagrees (a
+          * wrapped/CPU-modified coordinate) must not be believed. */
+-        if ((px >> 16) != int_x || (py >> 16) != int_y) {
++        /* A scalar-derived half replaces the guest's chain of truncations, so
++         * it may sit some pixels away: accept within kScalarRelax16 instead. */
++        const int32_t kRelax = kScalarRelax16;
++        int ok_x = (pflags & PGXP_F_RX)
++                       ? (std::abs(px - ((int_x << 16) + 0x8000)) <= kRelax + 0x8000)
++                       : ((px >> 16) == int_x);
++        int ok_y = (pflags & PGXP_F_RY)
++                       ? (std::abs(py - ((int_y << 16) + 0x8000)) <= kRelax + 0x8000)
++                       : ((py >> 16) == int_y);
++        if (!ok_x || !ok_y) {
+             s_stats.trunc_reject++;
+             have = 0;
+-        } else if (s_tolerance >= 0.0f) {
++        } else if (s_tolerance >= 0.0f && !(pflags & (PGXP_F_RX | PGXP_F_RY))) {
+             float dx = (float)(px - (int_x << 16)) * (1.0f / 65536.0f);
+             float dy = (float)(py - (int_y << 16)) * (1.0f / 65536.0f);
+             if (dx > s_tolerance || dy > s_tolerance) {

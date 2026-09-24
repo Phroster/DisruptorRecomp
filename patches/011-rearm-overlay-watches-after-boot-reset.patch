@@ -1,0 +1,54 @@
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -1090,6 +1090,12 @@ void memory_init(const char* bios_path) {
+     i_mask = 0;
+     /* Host dirty/text/overlay bitmaps survive memset(ram) and fork dig0. */
+     dirty_ram_reset_for_boot();
++    /* The reset above wiped the overlay loader's page watches (the loader
++     * indexes its cache before memory_init runs); re-arm them. */
++    {
++        extern void overlay_loader_rearm_after_boot_reset(void);
++        overlay_loader_rearm_after_boot_reset();
++    }
+     /* Re-latch kbless window from the newly activated psx_bios_image. */
+     psx_kernel_bless_reset_for_boot();
+ 
+diff --git a/runtime/src/overlay_loader.c b/runtime/src/overlay_loader.c
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -2947,6 +2947,34 @@ void overlay_loader_resync_validation_after_restore(void)
+ #endif
+ }
+ 
++/* memory_init() runs AFTER overlay_loader_init() and its
++ * dirty_ram_reset_for_boot() wipes the overlay watch bitmap and page
++ * generations that scan_cache_dir() armed for every indexed manifest. With the
++ * watches gone, guest writes to a manifested page neither bump its generation
++ * nor invalidate the final-miss cache, so a manifest function first judged
++ * ENTRY_INVALID (e.g. a kernel install slot checked before the guest's patcher
++ * finished) keeps that verdict forever and its bundle never loads: the code
++ * interprets for the life of the process although a byte-exact shard is
++ * cached. Re-arm every watch and drop all host-side validation memos. */
++void overlay_loader_rearm_after_boot_reset(void)
++{
++    if (!s_active) return;
++    for (int li = 0; li < s_lazy_man_n; li++) {
++        LazyMan *lm = &s_lazy_man[li];
++        for (int r = 0; r < lm->fn.n; r++)
++            overlay_watch_set_range(lm->fn.lo[r] & 0x1FFFFFFFu, lm->fn.len[r]);
++        lm->val_gen = 0;
++        lm->state = 0xFFu;
++    }
++    for (int i = 0; i < s_cand_n; i++) {
++        Candidate *c = &s_cand[i];
++        for (int r = 0; r < c->nranges; r++)
++            overlay_watch_set_range(c->range_lo[r], c->range_len[r]);
++    }
++    overlay_loader_resync_validation_after_restore();
++    overlay_loader_clear_lazy_miss();
++}
++
+ /* Re-scan the cache dir for DLLs compiled after init (step 2.8 autocompile)
+  * and clear the checked-regions memo so the next dispatch into a window
+  * region reconsiders the cache. Already-loaded DLLs stay loaded;

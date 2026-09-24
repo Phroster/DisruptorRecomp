@@ -1,0 +1,762 @@
+[game]
+name = "Disruptor"
+id = "SLUS-00224"
+exe = "input/SLUS_002.24"
+disc = "disc/Disruptor.cue"
+load_address = "0x80010000"
+entry_pc = "0x80048CE4"
+text_size = "0x00061800"
+stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "input/functions.txt"
+bios_config = "psxrecomp/bios/OpenBIOS.toml"
+out_dir = "generated"
+strict = true
+discovery = "whole-image"
+mod_function_entry_funcs = ["0x8004FA60", "0x80046134"]
+
+[[recompiler.patch]]
+id = "fps-cap-60"
+address = "0x800205B8"
+expected = "0x28420002"
+replacement = "0x28420001"
+note = "limiter slti 2 -> 1"
+
+# NOT patched on purpose: the main loop's first VSync(0) at 0x8002059C/A0 stays
+# a real blocking wait. It is the engine's ONE wait per iteration: with it the
+# loop runs exactly one update+render pass per VBlank. Turning it into
+# VSync(-1) as well (the former "loop-wait-update" patch) let the engine
+# free-run: in cheap views it completed 1.3+ passes per VBlank, the extra
+# passes advanced 0 ticks, and ~20 % of the presented pictures were duplicates
+# (measured: 46-51 new pictures/s while turning, at a steady 60 presents/s).
+
+[[recompiler.patch]]
+id = "loop-wait-render"
+address = "0x80043444"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "render frame-sync call a0=0 -> a0=-1"
+
+[[recompiler.patch]]
+id = "loop-wait-00"
+address = "0x800205C8"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+[[recompiler.patch]]
+id = "loop-wait-01"
+address = "0x80020B68"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+[[recompiler.patch]]
+id = "loop-wait-02"
+address = "0x80043590"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+[[recompiler.patch]]
+id = "loop-wait-03"
+address = "0x800438B8"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+# Gameplay loop limiter (func_80043404, 0x80043E7C..0x80043EB0):
+#     VSync(0);                                  <- ONE blocking wait per pass
+#     if (VSync(-1) - last < 2) VSync(0);        <- 30 fps limiter
+#     ticks = VSync(-1) - last; last = ...       <- logic advances by `ticks`
+# 60 fps = keep the first wait, make the limiter "< 1" so its second wait never
+# runs. The former "loop-wait-04" patch also turned the FIRST wait into
+# VSync(-1); with no wait left the engine free-ran (1.35 passes per VBlank in
+# cheap views, extra passes with ticks = 0 -> ~20 % duplicate pictures, and
+# doubled host CPU cost under the guest overclock).
+[[recompiler.patch]]
+id = "fps-cap-60-game"
+address = "0x80043E90"
+expected = "0x28420002"
+replacement = "0x28420001"
+note = "gameplay limiter slti 2 -> 1 (one VBlank per pass)"
+
+[[recompiler.patch]]
+id = "loop-wait-05"
+address = "0x80043EA0"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+[[recompiler.patch]]
+id = "loop-wait-06"
+address = "0x80044604"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+[[recompiler.patch]]
+id = "loop-wait-07"
+address = "0x800485C0"
+expected = "0x00002021"
+replacement = "0x2404FFFF"
+note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+
+# --- True 16:9: widen the engine's portal windows (no edge stretch) --------
+# Disruptor is a portal renderer. func_8003A0F0 projects each portal's two edge
+# points with x*160/z + 160 and clamps the resulting screen window to [0, 320];
+# the root sector is drawn with a literal [0, 320]. The terrain renderer
+# (func_80046134) drops every polygon whose four corners fall on one side of
+# that window, so nothing exists beyond the 4:3 edges. These patches run the
+# whole portal pass in coordinates biased by +64 px with the range [0, 448];
+# the mod's entry hook on func_80046134 removes the bias, giving real windows
+# of [-64, 384] (16:9 shows -53..373). Only immediates change.
+# The portal walk itself starts from two frustum rays at yaw +-32 (45 deg =
+# the 4:3 field of view) and clips every portal to them BEFORE projecting, so
+# the rays are widened to +-39 (54.8 deg, tan = 1.418 -> +-227 px) as well.
+[[recompiler.patch]]
+id = "ws-root-xmax"
+address = "0x8003A430"
+expected = "0x34020140"
+replacement = "0x340201C0"
+note = "root sector window xmax 320 -> 448 (biased coords)"
+
+[[recompiler.patch]]
+id = "ws-revisit-full-0"
+address = "0x8003A490"
+expected = "0x34020140"
+replacement = "0x340201C0"
+note = "revisited sector: full window 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-portal-xmin-ofs"
+address = "0x8003A578"
+expected = "0x244400A0"
+replacement = "0x244400E0"
+note = "portal left edge: x*160/z + 160 -> + 224 (bias 64)"
+
+[[recompiler.patch]]
+id = "ws-portal-xmin-lt-0"
+address = "0x8003A580"
+expected = "0x28820141"
+replacement = "0x288201C1"
+note = "portal left edge upper test 321 -> 449"
+
+[[recompiler.patch]]
+id = "ws-portal-xmin-lt-1"
+address = "0x8003A588"
+expected = "0x28820141"
+replacement = "0x288201C1"
+note = "portal left edge upper test 321 -> 449"
+
+[[recompiler.patch]]
+id = "ws-portal-xmin-clamp"
+address = "0x8003A594"
+expected = "0x34040140"
+replacement = "0x340401C0"
+note = "portal left edge upper clamp 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-ofs"
+address = "0x8003A650"
+expected = "0x244300A2"
+replacement = "0x244300E2"
+note = "portal right edge: x*160/z + 162 -> + 226 (bias 64)"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-lt-0"
+address = "0x8003A658"
+expected = "0x28620141"
+replacement = "0x286201C1"
+note = "portal right edge upper test 321 -> 449"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-lt-1"
+address = "0x8003A660"
+expected = "0x28620141"
+replacement = "0x286201C1"
+note = "portal right edge upper test 321 -> 449"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-clamp"
+address = "0x8003A66C"
+expected = "0x34030140"
+replacement = "0x340301C0"
+note = "portal right edge upper clamp 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-near"
+address = "0x8003A67C"
+expected = "0x28620141"
+replacement = "0x286201C1"
+note = "near-portal +8 upper test 321 -> 449"
+
+[[recompiler.patch]]
+id = "ws-portal-xmax-nearc"
+address = "0x8003A688"
+expected = "0x34030140"
+replacement = "0x340301C0"
+note = "near-portal +8 upper clamp 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-portal-reject"
+address = "0x8003A69C"
+expected = "0x28820140"
+replacement = "0x288201C0"
+note = "portal reject when xmin >= 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-revisit-full-1"
+address = "0x8003A79C"
+expected = "0x34020140"
+replacement = "0x340201C0"
+note = "linked sector A revisit: full window 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-link-full-a"
+address = "0x8003A7EC"
+expected = "0x34030140"
+replacement = "0x340301C0"
+note = "linked sector A: full window 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-revisit-full-2"
+address = "0x8003A850"
+expected = "0x34020140"
+replacement = "0x340201C0"
+note = "linked sector B revisit: full window 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-link-full-b"
+address = "0x8003A8A0"
+expected = "0x34030140"
+replacement = "0x340301C0"
+note = "linked sector B: full window 320 -> 448"
+
+[[recompiler.patch]]
+id = "ws-subdiv-xmin"
+address = "0x8004792C"
+expected = "0x20080000"
+replacement = "0x2008FFC0"
+note = "close-up subdivided polys: window xmin 0 -> -64"
+
+[[recompiler.patch]]
+id = "ws-subdiv-xmax"
+address = "0x80047930"
+expected = "0x20090140"
+replacement = "0x20090180"
+note = "close-up subdivided polys: window xmax 320 -> 384"
+
+[[recompiler.patch]]
+id = "ws-frustum-left"
+address = "0x80040FE8"
+expected = "0x24710020"
+replacement = "0x24710027"
+note = "initial portal frustum ray yaw+32 (45 deg, 4:3) -> yaw+39 (54.8 deg = +-224 px at focal 160)"
+
+[[recompiler.patch]]
+id = "ws-frustum-right"
+address = "0x80040FF0"
+expected = "0x2472FFE0"
+replacement = "0x2472FFD9"
+note = "initial portal frustum ray yaw-32 -> yaw-39"
+
+# Sprites (bodies, pickups, enemies, effects) are projected on the CPU by four
+# sibling routines, each with its own frustum test in camera space:
+#     if (z + margin < x || z + margin < -x) skip;      (x/z = 1 is the 4:3 edge)
+# so every sprite vanished once its centre passed the 4:3 edge. The 16:9 edge is
+# x/z = 1.33. The same instruction slots now test |x| <= 2z + margin with one
+# unsigned compare, (unsigned)(x + B) <= 2B with B = 2z + margin; the first of
+# the two branches becomes a plain instruction, the second still jumps to the
+# same skip label. 2z keeps x*160/z + 160 inside [-160, 480] plus the margin,
+# so nothing can wrap the GPU's 11-bit coordinates that could not before.
+# Routine 4 used the same temporary for its vertical test, which is rebuilt the
+# same way with its stock bound (|dy| <= z + 64).
+[[recompiler.patch]]
+id = "ws-sprite-a-0"
+address = "0x8003B8E8"
+expected = "0x26030020"
+replacement = "0x00101840"
+note = "v1 = z + 32 -> v1 = 2z"
+
+[[recompiler.patch]]
+id = "ws-sprite-a-1"
+address = "0x8003B8EC"
+expected = "0x0067102A"
+replacement = "0x24630020"
+note = "slt v0,v1,x -> v1 += 32 (B)"
+
+[[recompiler.patch]]
+id = "ws-sprite-a-2"
+address = "0x8003B8F0"
+expected = "0x144000A8"
+replacement = "0x00E31021"
+note = "bnez skip -> v0 = x + B"
+
+[[recompiler.patch]]
+id = "ws-sprite-a-3"
+address = "0x8003B8F4"
+expected = "0x00071023"
+replacement = "0x00031840"
+note = "v0 = -x -> v1 = 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-a-4"
+address = "0x8003B8F8"
+expected = "0x0062102A"
+replacement = "0x0062102B"
+note = "slt -> sltu v0,v1,v0: skip if (unsigned)(x + B) > 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-b-0"
+address = "0x8003BCFC"
+expected = "0x26030020"
+replacement = "0x00101840"
+note = "v1 = z + 32 -> v1 = 2z"
+
+[[recompiler.patch]]
+id = "ws-sprite-b-1"
+address = "0x8003BD00"
+expected = "0x0067102A"
+replacement = "0x24630020"
+note = "slt v0,v1,x -> v1 += 32 (B)"
+
+[[recompiler.patch]]
+id = "ws-sprite-b-2"
+address = "0x8003BD04"
+expected = "0x144000AD"
+replacement = "0x00E31021"
+note = "bnez skip -> v0 = x + B"
+
+[[recompiler.patch]]
+id = "ws-sprite-b-3"
+address = "0x8003BD08"
+expected = "0x00071023"
+replacement = "0x00031840"
+note = "v0 = -x -> v1 = 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-b-4"
+address = "0x8003BD0C"
+expected = "0x0062102A"
+replacement = "0x0062102B"
+note = "slt -> sltu v0,v1,v0: skip if (unsigned)(x + B) > 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-c-0"
+address = "0x8003C194"
+expected = "0x02A9102A"
+replacement = "0x00151840"
+note = "slt v0,z,x -> v1 = 2z (B)"
+
+[[recompiler.patch]]
+id = "ws-sprite-c-1"
+address = "0x8003C198"
+expected = "0x14400256"
+replacement = "0x01231021"
+note = "bnez skip -> v0 = x + B"
+
+[[recompiler.patch]]
+id = "ws-sprite-c-2"
+address = "0x8003C19C"
+expected = "0x00091023"
+replacement = "0x00031840"
+note = "v0 = -x -> v1 = 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-c-3"
+address = "0x8003C1A0"
+expected = "0x02A2102A"
+replacement = "0x0062102B"
+note = "slt -> sltu v0,v1,v0"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-0"
+address = "0x8003CDA0"
+expected = "0x26830040"
+replacement = "0x00141840"
+note = "v1 = z + 64 -> v1 = 2z"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-1"
+address = "0x8003CDA4"
+expected = "0x0068102A"
+replacement = "0x24630040"
+note = "slt v0,v1,x -> v1 += 64 (B)"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-2"
+address = "0x8003CDA8"
+expected = "0x144001C7"
+replacement = "0x01031021"
+note = "bnez skip -> v0 = x + B"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-3"
+address = "0x8003CDAC"
+expected = "0x00081023"
+replacement = "0x00031840"
+note = "v0 = -x -> v1 = 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-4"
+address = "0x8003CDB0"
+expected = "0x0062102A"
+replacement = "0x0062102B"
+note = "slt -> sltu v0,v1,v0"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-5"
+address = "0x8003CDB8"
+expected = "0x0065102A"
+replacement = "0x26830040"
+note = "delay slot: slt v0,v1,dy -> v1 = z + 64 (stock vertical bound)"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-6"
+address = "0x8003CDBC"
+expected = "0x144001C2"
+replacement = "0x00A31021"
+note = "bnez skip -> v0 = dy + B"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-7"
+address = "0x8003CDC0"
+expected = "0x00051023"
+replacement = "0x00031840"
+note = "v0 = -dy -> v1 = 2B"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-8"
+address = "0x8003CDC4"
+expected = "0x0062102A"
+replacement = "0x0062102B"
+note = "slt -> sltu v0,v1,v0"
+
+# Routine 4 (actors, bodies, pickups) then drops a projected sprite unless its
+# screen rectangle overlaps x in [21, 300) (and y in [21, 220), left alone): a
+# body vanished as soon as its far edge crossed x = 21. Widened to the biased
+# portal range [-64, 384); 16:9 shows -53..373.
+[[recompiler.patch]]
+id = "ws-sprite-d-win-0"
+address = "0x8003D0F8"
+expected = "0x28E2012C"
+replacement = "0x28E20180"
+note = "sprite left < 300 -> < 384"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-win-1"
+address = "0x8003D108"
+expected = "0x28420015"
+replacement = "0x2842FFC0"
+note = "sprite right < 21 -> < -64"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-win-2"
+address = "0x8003D110"
+expected = "0x2842012C"
+replacement = "0x28420180"
+note = "mirrored sprite: left < 300 -> < 384"
+
+[[recompiler.patch]]
+id = "ws-sprite-d-win-3"
+address = "0x8003D118"
+expected = "0x28E20015"
+replacement = "0x28E2FFC0"
+note = "mirrored sprite: right < 21 -> < -64"
+
+# Weapon / psionic quick swap: a second press of the weapon (psionic) button
+# within 30 engine frames of the first swaps to the previous weapon (power).
+# The input handler counts engine frames (gp+1452, +1 per pass), which the 60
+# fps engine mod doubled, so the window shrank from one second to half a
+# second. 60 frames restores the original second.
+[[recompiler.patch]]
+id = "fps-quickswap-weapon"
+address = "0x800398FC"
+expected = "0x2842001E"
+replacement = "0x2842003C"
+note = "weapon double-tap window slti 30 -> 60 engine frames"
+
+[[recompiler.patch]]
+id = "fps-quickswap-psionic"
+address = "0x80039A18"
+expected = "0x2842001E"
+replacement = "0x2842003C"
+note = "psionic double-tap window slti 30 -> 60 engine frames"
+
+# The engine's VBlank wait (func_8004B51C) is
+#     do { if (--timeout_on_stack == -1) { timeout path } } while (Vcount < target);
+# two basic blocks and a stack store per iteration, which the runtime's idle
+# skipper rejects (it needs one resume PC and no stores), so every guest cycle
+# spent waiting was executed on the host: 27 percent of host time in a
+# profiled scene, and the reason a higher guest overclock cost host CPU.
+# Branching back to the Vcount poll (0x8004B590) instead of the timeout
+# countdown (0x8004B544) makes it a single store-free block the skipper
+# fast-forwards. The dropped countdown only guarded against a VBlank that
+# never comes.
+[[recompiler.patch]]
+id = "vsync-wait-skippable"
+address = "0x8004B5A0"
+expected = "0x1440FFE8"
+replacement = "0x1440FFFB"
+note = "bnez v0,0x8004B544 -> bnez v0,0x8004B590 (poll-only wait loop)"
+
+# --- Sky panorama: use the same [-64,384] view as the terrain -----------
+# func_8003AF68 projects a portal opening, clamps it to the original 0..320,
+# then emits textured rectangles from a 1280-pixel circular panorama. Widen
+# both the portal and full-background paths, preserving projection and UV scale.
+# The left reveal can make the panorama start negative: normalize it modulo
+# 1280 and shift the end by the identical amount. The tile loop already wraps
+# positive ends. Integer and branch-delay behaviour is checked by
+# tools/test_sky_window.py against the disc instructions plus these patches.
+
+[[recompiler.patch]]
+id = "ws-sky-xmin-register"
+address = "0x8003AFE0"
+expected = "0x00000000"
+replacement = "0x2419FFC0"
+note = "Set caller-saved t9 to -64 in the existing delay slot; no calls precede clipping."
+
+[[recompiler.patch]]
+id = "ws-sky-left-reject-bound"
+address = "0x8003B24C"
+expected = "0x28420140"
+replacement = "0x28430180"
+note = "Reject left >= 384; preserve projected x in v0 for the lower-bound test."
+
+[[recompiler.patch]]
+id = "ws-sky-left-reject-branch"
+address = "0x8003B250"
+expected = "0x10400116"
+replacement = "0x10600116"
+note = "Consume the upper-bound result in v1."
+
+[[recompiler.patch]]
+id = "ws-sky-left-clamp-test"
+address = "0x8003B254"
+expected = "0x00000000"
+replacement = "0x2842FFC0"
+note = "In the branch delay slot, test projected left < -64."
+
+[[recompiler.patch]]
+id = "ws-sky-left-clamp-branch"
+address = "0x8003B260"
+expected = "0x07010003"
+replacement = "0x10400003"
+note = "Keep projected left when it is already >= -64."
+
+[[recompiler.patch]]
+id = "ws-sky-left-clamp-store"
+address = "0x8003B268"
+expected = "0xAFA00040"
+replacement = "0xAFB90040"
+note = "Clamp left to -64, including a near-plane-clipped left endpoint."
+
+[[recompiler.patch]]
+id = "ws-sky-right-near-default"
+address = "0x8003B274"
+expected = "0x34180140"
+replacement = "0x34180180"
+note = "Near-plane-clipped right endpoint defaults to 384."
+
+[[recompiler.patch]]
+id = "ws-sky-right-reject-test"
+address = "0x8003B2A4"
+expected = "0x18400101"
+replacement = "0x0322182A"
+note = "Test -64 < projected right before keeping the portal sky span."
+
+[[recompiler.patch]]
+id = "ws-sky-right-reject-branch"
+address = "0x8003B2A8"
+expected = "0xAFA20028"
+replacement = "0x10600100"
+note = "Reject a sky span wholly left of -64."
+
+[[recompiler.patch]]
+id = "ws-sky-right-store"
+address = "0x8003B2AC"
+expected = "0x28420141"
+replacement = "0xAFA20028"
+note = "Store the unmodified projected right in the rejection branch delay slot."
+
+[[recompiler.patch]]
+id = "ws-sky-right-clamp-test"
+address = "0x8003B2B0"
+expected = "0x14400004"
+replacement = "0x28420181"
+note = "Keep right <= 384."
+
+[[recompiler.patch]]
+id = "ws-sky-right-clamp-branch"
+address = "0x8003B2B4"
+expected = "0x31E200FF"
+replacement = "0x14400002"
+note = "Skip the clamp store when in range, then compute the original fog flag."
+
+[[recompiler.patch]]
+id = "ws-sky-right-clamp-value"
+address = "0x8003B2B8"
+expected = "0x34180140"
+replacement = "0x34180180"
+note = "Set the right clamp in the existing delay slot."
+
+[[recompiler.patch]]
+id = "ws-sky-full-right"
+address = "0x8003B318"
+expected = "0x34180140"
+replacement = "0x34180180"
+note = "The unbounded-sky path covers right edge 384."
+
+[[recompiler.patch]]
+id = "ws-sky-full-left"
+address = "0x8003B320"
+expected = "0xAFA00040"
+replacement = "0xAFB90040"
+note = "The unbounded-sky path starts at -64."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-load-start"
+address = "0x8003B358"
+expected = "0x8FB80018"
+replacement = "0x8FB90018"
+note = "Keep panorama end in t8 while loading its possibly negative start into t9."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-period"
+address = "0x8003B35C"
+expected = "0x00000000"
+replacement = "0x34030500"
+note = "Set the panorama period in the load delay slot."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-remainder"
+address = "0x8003B360"
+expected = "0x2B020500"
+replacement = "0x0323001A"
+note = "Signed remainder handles both sides of the 1280-pixel panorama."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-read-remainder"
+address = "0x8003B364"
+expected = "0x14400006"
+replacement = "0x00001010"
+note = "Read the signed remainder from HI."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-negative-test"
+address = "0x8003B368"
+expected = "0x2718FB00"
+replacement = "0x04410002"
+note = "A nonnegative remainder needs no correction."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-delay"
+address = "0x8003B36C"
+expected = "0xAFB80018"
+replacement = "0x00000000"
+note = "Delay slot must not change the panorama start."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-negative-add"
+address = "0x8003B370"
+expected = "0x8FB80028"
+replacement = "0x24420500"
+note = "Convert a negative remainder to the last part of the panorama."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-delta"
+address = "0x8003B374"
+expected = "0x00000000"
+replacement = "0x00591823"
+note = "Compute the period shift applied to the start."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-store-start"
+address = "0x8003B378"
+expected = "0x2718FB00"
+replacement = "0xAFA20018"
+note = "Store the normalized panorama start."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-shift-end"
+address = "0x8003B37C"
+expected = "0xAFB80028"
+replacement = "0x0303C021"
+note = "Apply the same shift to the end, preserving span width and texture phase."
+
+[[recompiler.patch]]
+id = "ws-sky-wrap-store-end"
+address = "0x8003B384"
+expected = "0x8FB80028"
+replacement = "0xAFB80028"
+note = "Keep the wrapped end for subsequent rows and the existing tile-boundary loop."
+
+[runtime]
+debug_port = 4624
+window_title = "Disruptor Recompiled"
+memcard_dir = "saves"
+disc_speed = "1x"
+bios_hle = false
+overlay_cache = true
+# Fast-forward the engine's VBlank poll loop (func_8004B51C) instead of
+# executing it: needed with the CPU overclock so the wait costs no host time.
+idle_skip = true
+overlay_backend = "auto"
+overlay_autocompile_cmd = 'python "psxrecomp/tools/compile_overlays.py" --captures "build/overlay_captures.json" --game-toml "game.toml" --recompiler ".local/build-recompiler/psxrecomp-game.exe" --runtime-include "psxrecomp/runtime/include" --project-root "." --out-dir "build/cache" --compiler gcc'
+
+[video]
+aspect_ratio = "4:3"
+renderer = "opengl"
+# Internal resolution multiplier (1..4). 4 = 1280x960 for the 320x240 game,
+# scaled to the window; rendered on the GPU, so it costs the game thread nothing.
+supersampling = 4
+antialiasing = false
+texture_filtering = "nearest"
+# PGXP (needs the PGXP build, CMake DISRUPTOR_PGXP=ON, the default):
+# geometry_correction keeps the sub-pixel part of every projected vertex the
+# GTE throws away (no more polygon wobble), perspective_texturing interpolates
+# textures with depth (no more affine warping on walls and floors).
+# Measured in a heavy gameplay view: 97 % of all vertices arrive with a precise
+# position (dataflow 23.1 % + fallback 1.2 % accepted, 72.8 % rejected only by
+# the 0.5 px clamp below; 0 value mismatches, 0 truncation rejects), and 91 %
+# of textured triangles get perspective UVs.
+geometry_correction = true
+perspective_texturing = true
+# The framework default 0.5 discards every vertex whose sub-pixel part exceeds
+# half a pixel - a guard for titles with low coverage, where precise and
+# snapped vertices would meet along an edge. Coverage here is near total, so
+# the clamp would only put three quarters of the wobble back. -1 = off.
+pgxp_tolerance = -1.0
+# CPU mode also carries precision through the game's own vertex arithmetic:
+# 99.8 % of triangle vertices arrive sub-pixel with it, 97.6 % without
+# (tools/seam_census.py, gameplay). No measurable cost: 9.9-10.0 ms of host CPU
+# per engine pass with it, 10.0-10.8 without (heaviest saved view, headless
+# diagnostics build, 300 %). What neither mode can fix - the game's meshes not
+# being watertight - is covered by the renderer's crack fill (run.ps1,
+# PSX_GL_CRACK_FILL).
+pgxp_cpu_mode = true
+
+[controller]
+default_mode = "digital"
+allow_hybrid = false
+lock_mode = true
+p1_device = "auto"
+
+[widescreen]
+offer = false
+offer_ultrawide = false
+adaptive_view = false
+gte_game_mode = true
+native_wide = true
+hud_sprt_squash = false
+nw_textured_edges = false
+nw_textured_edge_scale = 200
+nw_full_mirror = false
+nw_flat_backdrop = true
+
+[widescreen.cull]
+auto_screen_x = true
+screen_w_imms = ["0x140", "0x141", "0x180", "0x181"]
+screen_h_imms = ["0xEF", "0xF0", "0xF1", "0x1E0"]

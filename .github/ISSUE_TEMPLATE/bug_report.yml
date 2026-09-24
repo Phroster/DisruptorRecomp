@@ -1,0 +1,38 @@
+name: 🐞 Bug report
+description: Something doesn't work or looks wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for testing! The more detail you give, the faster it gets fixed.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown at the bottom left of the launcher.
+      placeholder: 1.0.0-rc.1
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Which level or menu were you in, what did you do, and what went wrong?
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: Your PC
+      description: Windows version, graphics card, and controller if you used one.
+      placeholder: Windows 11, NVIDIA RTX 3060, Xbox controller
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: In the launcher click "Logs folder" and drag game-last.log (and build-last.log if the build failed) here.
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or video
+      description: Optional, but very helpful for graphics problems.

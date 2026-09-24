@@ -1,0 +1,55 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index b78b6be7..4d2113cf 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2930,6 +2930,22 @@ static int host_refresh_matches_guest_cadence(void) {
+     return std::fabs(g_host_refresh_hz - guest_hz) <= guest_hz * 0.02;
+ }
+ 
++/* Integer-multiple vsync: a 120/180/240 Hz panel shows a 60 Hz guest evenly
++ * when every guest frame is held for exactly N refreshes. Returns N (2..4)
++ * when the host refresh is within 1% of N x guest rate, else 0. The
++ * wall-clock pacer still runs underneath as a deadline cap, exactly as on the
++ * 1:1 path, so a swap that does not block cannot free-run the game. */
++static int host_refresh_guest_multiple(void) {
++    if (g_host_refresh_hz <= 0.0 || g_guest_frame_period_ms <= 0.0)
++        return 0;
++    const double guest_hz = 1000.0 / g_guest_frame_period_ms;
++    for (int n = 2; n <= 4; ++n) {
++        if (std::fabs(g_host_refresh_hz - guest_hz * n) <= guest_hz * n * 0.01)
++            return n;
++    }
++    return 0;
++}
++
+ static void refresh_host_display_cadence(int force_log, int force_probe) {
+ #ifndef PSX_SDL_NO_RENDER
+     if (!sdl_window)
+@@ -2968,6 +2984,14 @@ static void refresh_host_display_cadence(int force_log, int force_probe) {
+         g_frame_period_ms = 1000.0 / host_hz;
+         std::printf("psxrecomp: sync-to-host-refresh: pacing to %.1f Hz panel "
+                     "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
++    } else if (g_video_vsync > 0 && host_refresh_guest_multiple() >= 2) {
++        /* Integer-multiple panel (e.g. 120 Hz): pace to exactly 1/N of the
++         * panel so every guest frame is held for N refreshes with no drift
++         * slip, same trade as the 1:1 path above. */
++        const int n = host_refresh_guest_multiple();
++        g_frame_period_ms = 1000.0 * (double)n / host_hz;
++        std::printf("psxrecomp: sync-to-host-refresh: %.1f Hz panel, %dx vsync "
++                    "(%.4f ms/frame)\n", host_hz, n, g_frame_period_ms);
+     } else if (host_hz > 0.0) {
+         std::printf("psxrecomp: host panel %.1f Hz does not match guest "
+                     "cadence; keeping %.2f Hz pacing\n",
+@@ -3043,6 +3067,12 @@ static int present_effective_swap_interval(void) {
+         return 0;
+     if (present_vsync_owns_cadence())
+         return g_video_vsync;
++    if (g_video_vsync > 0 && !g_present_vsync_disabled &&
++        !host_driver_vsync_unreliable()) {
++        const int n = host_refresh_guest_multiple();
++        if (n >= 2)
++            return n;
++    }
+     return 0;
+ }
+ 

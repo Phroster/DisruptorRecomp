@@ -1,0 +1,89 @@
+diff --git a/runtime/src/overlay_loader.c b/runtime/src/overlay_loader.c
+index df7a2c33..93d1498c 100644
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -3582,6 +3582,18 @@ static int overlay_find_by_range(uint32_t phys) {
+     return best;
+ }
+ 
++/* Candidate space for dispatch: the kernel/overlay windows, plus any PC whose
++ * live bytes match a captured manifest entry. The second clause admits clean
++ * static misses — game-text PCs the compiled dispatch table has no entry for
++ * (computed jumps into function interiors, packed self-overlays): the
++ * interpreter is already executing those live RAM bytes, so a byte-guarded
++ * captured shard can only replace interpreter work, never static-native work.
++ * The shard's own per-dispatch CRC guard still rejects stale code, and a
++ * failed load is memoized in the lazy miss cache. */
++static int loader_candidate_space(uint32_t phys) {
++    return overlay_cache_window_contains(phys) || lazy_has_exact_entry(phys);
++}
++
+ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     /* Overlay dispatch is a no-op when the overlay loader is inactive
+@@ -3597,7 +3609,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+      * overlay-off + CPS game hit this and wedged at boot before any game code ran
+      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
+     if (!s_active) return 0;
+-    if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
++    if (loader_candidate_space(phys) && lazy_miss_cached(phys)) {
+         s_disp_interp++;
+         return 0;
+     }
+@@ -3608,7 +3620,7 @@ retry_candidates:
+     int loaded_range_ci = -1;
+     int lazy_exact = 0;
+     int exact_needs_load = 0;
+-    if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
++    if (head < 0 && s_active && loader_candidate_space(phys)) {
+         lazy_exact = head < 0 && lazy_has_exact_entry(phys);
+         /* A CPS continuation is normally not a registered function ENTRY. Its
+          * already-loaded range owner must be checked before lazy discovery:
+@@ -3689,7 +3701,12 @@ retry_candidates:
+                 int in_own_shadow = (s_in_shadow && (const void *)c == s_shadow_cand);
+                 if (!in_own_shadow) {
+                     int want_diff = s_diff_mode && cand_selected_for_diff(c);
+-                    if (want_diff && addr < 0x10000u) want_diff = 0;
++                    /* Same exclusion as the entry chain below: pre-overlay-band
++                     * code (kernel gates AND clean static-miss text) can block
++                     * inside kernel services, which a shadow cannot double-run.
++                     * Compare the MASKED phys: the guest PC arrives in KSEG0
++                     * form (0x80xxxxxx), so a raw addr compare never matched. */
++                    if (want_diff && phys < OVERLAY_REGION_FLOOR) want_diff = 0;
+                     if (want_diff && (s_diff_addr || c->diff_passes < OVERLAY_DIFF_BUDGET)) {
+                         if (_probe) s_cps_probe_outcome = 5;
+                         s_diffgate_interp++;
+@@ -3807,8 +3824,15 @@ retry_candidates:
+              * legitimately run different instruction paths and every call
+              * "diverges" (observed: 2016/2017 calls, all 0xB0, flooding the
+              * ring). The diff harness validates OVERLAY shard codegen against
+-             * the interp oracle; kernel gates stay on their normal route. */
+-            if (want_diff && addr < 0x10000u) want_diff = 0;
++             * the interp oracle; kernel gates stay on their normal route.
++             * Clean static-miss text candidates (game-text PCs served from a
++             * captured shard because the compiled dispatch table has no entry
++             * for them) are the same class — they call the same blocking
++             * kernel services — so the exclusion covers the whole pre-overlay
++             * band, not just the 64K kernel window. Compare the MASKED phys:
++             * the guest PC arrives in KSEG0 form (0x80xxxxxx), so a raw addr
++             * compare never matched. */
++            if (want_diff && phys < OVERLAY_REGION_FLOOR) want_diff = 0;
+             if (want_diff && !s_in_shadow &&
+                 (s_diff_addr || c->diff_passes < OVERLAY_DIFF_BUDGET)) {
+                 /* NEVER start a shadow inside an exception dispatch: the guest's
+@@ -3906,13 +3930,13 @@ retry_candidates:
+     /* Publish at most one cached DLL and retry this same dispatch once. This
+      * preserves additive variant coverage without turning one guest transition
+      * into an unbounded synchronous LoadLibrary loop. */
+-    if (!lazy_loaded && s_active && overlay_cache_window_contains(phys) &&
++    if (!lazy_loaded && s_active && loader_candidate_space(phys) &&
+         try_load_region(phys)) {
+         lazy_loaded = 1;
+         goto retry_candidates;
+     }
+ 
+-    if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
++    if (loader_candidate_space(phys)) lazy_miss_record(phys);
+     s_disp_interp++;
+     return 0;
+ }

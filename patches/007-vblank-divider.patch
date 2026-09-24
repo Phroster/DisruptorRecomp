@@ -1,0 +1,25 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -14942,6 +15018,21 @@ session_reboot:
+             std::fprintf(stdout, "psxrecomp: disc region %s (serial %s)\n",
+                          ident.region.c_str(), ident.detected_serial.c_str());
+     }
++    /* Optional VBlank rate multiplier: divide the guest-time VBlank period so
++     * VBlank-divided engines (e.g. Disruptor's render-every-other-vblank loop)
++     * draw at a higher rate while guest cycles/second stay unchanged. The frame
++     * pacer period scales with the divisor so emulation speed is preserved. */
++    if (const char *e = std::getenv("PSX_VBLANK_DIV")) {
++        const long div = std::atol(e);
++        if (div >= 2 && div <= 4) {
++            vblank_cycles = (uint32_t)(vblank_cycles / (uint32_t)div);
++            g_guest_frame_period_ms = 1000.0 / (59.94 * (double)div);
++            g_frame_period_ms = g_guest_frame_period_ms;
++            std::fprintf(stdout, "psxrecomp: VBlank divider %ld -> %u cycles, "
++                         "%.3f ms/frame\n", div, vblank_cycles,
++                         g_frame_period_ms);
++        }
++    }
+     /* Arm the text-image guard now that both possible sources are resolved:
+      * the local EXE file (dev checkouts) and the disc image (every install). */
+     if (game_config_path)

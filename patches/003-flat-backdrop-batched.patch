@@ -1,0 +1,20 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index d3cfebcf..6a12ae59 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -1932,8 +1932,13 @@ static void flush_flat_batch(void) {
+     if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+         !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
+         int dx = wide_dx();
+-        /* Batch may span many prims; use stretch gate off (flat dots/UI). */
+-        s_bd_gate = 0;
++        /* Batch may span many prims; default the stretch gate off (flat
++         * dots/UI). A title that opted into nw_flat_backdrop wants authored
++         * full-frame flat overlays — damage tints, screen fades — to reach the
++         * reveal margins, and those are exactly what arrives here as batched
++         * flat triangles. The canonical centre is blitted authoritatively, so
++         * stretching only affects margin contribution. */
++        s_bd_gate = gpu_ws_nw_flat_backdrop_enabled() ? 1 : 0;
+         gl_perf_mirror_begin();
+         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
+         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);

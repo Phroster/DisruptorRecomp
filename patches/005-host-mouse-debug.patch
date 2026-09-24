@@ -1,0 +1,72 @@
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index ebaf487e..6687fc36 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -18,6 +18,7 @@
+ #include <time.h>
+ #include "debug_server.h"
+ #include "psx_bss.h"
++#include "psx_keybinds.h"
+ #include "nd_intro_ot.h"
+ #include "latency_ring.h"
+ #include "overlay_loader.h"
+@@ -7645,6 +7646,50 @@ static void handle_press(int id, const char *json)
+     send_ok(id);
+ }
+ 
++/* Host mouse feed injection for headless input testing:
++ *   {"cmd":"host_mouse","wheel":N}  wheel notches (+up / -down)
++ *   {"cmd":"host_mouse","dx":N}     relative motion, pixels
++ * Feeds the keybind layer's MouseWheelUp/Down and MouseX-/MouseX+ pseudo
++ * bindings exactly like the SDL event watch does, so the full
++ * keybind -> pad-word chain can be exercised with no window. */
++static void handle_host_mouse(int id, const char *json)
++{
++    int wheel = json_get_int(json, "wheel", 0);
++    int dx = json_get_int(json, "dx", 0);
++    int dy = json_get_int(json, "dy", 0);
++    const int wheel_req = wheel;
++    while (wheel > 0) { psx_keybinds_mouse_wheel(1); wheel--; }
++    while (wheel < 0) { psx_keybinds_mouse_wheel(-1); wheel++; }
++    if (dx) psx_keybinds_mouse_motion((float)dx);
++    if (dy) psx_keybinds_mouse_motion_y((float)dy);
++    /* Report the keybind layer's own pad word so the pseudo-input chain can be
++     * verified independently of SIO delivery (headless included). */
++    const uint16_t kw = psx_keybinds_pad_word(
++        (const uint8_t *)SDL_GetKeyboardState(NULL), 1);
++    send_fmt("{\"id\":%d,\"ok\":true,\"wheel\":%d,\"dx\":%d,\"dy\":%d,"
++             "\"key_pad\":\"0x%04X\"}",
++             id, wheel_req, dx, dy, (unsigned)kw);
++}
++
++/* Host key injection for headless input testing:
++ *   {"cmd":"host_key","key":"R","down":1}   hold (1) / release (0) a key
++ * The key goes through keybinds.ini like a real one and merges with the other
++ * keybind-layer sources (mouse, game-mod buttons), which the whole-pad
++ * set_input override does not. `key` is an SDL key name. */
++static void handle_host_key(int id, const char *json)
++{
++    char name[64];
++    if (!json_get_str(json, "key", name, sizeof(name))) { send_err(id, "missing key"); return; }
++    const int down = json_get_int(json, "down", 1);
++    const SDL_Scancode sc = SDL_GetScancodeFromName(name);
++    if (sc == SDL_SCANCODE_UNKNOWN) { send_err(id, "unknown key"); return; }
++    psx_keybinds_debug_key((int)sc, down);
++    const uint16_t kw = psx_keybinds_pad_word(
++        (const uint8_t *)SDL_GetKeyboardState(NULL), 1);
++    send_fmt("{\"id\":%d,\"ok\":true,\"scancode\":%d,\"down\":%d,\"key_pad\":\"0x%04X\"}",
++             id, (int)sc, down, (unsigned)kw);
++}
++
+ /* Reports the current pad word(s) and any active input override. `pad` is
+  * slot 0 (kept for back-compat); slot0/slot1 report both ports' button word. */
+ extern uint16_t sio_get_pad_buttons(void);
+@@ -13695,6 +13740,8 @@ static const CmdEntry s_commands[] = {
+     { "dma_trace_clear",   handle_dma_trace_clear },
+     { "dma_cdrom_history", handle_dma_cdrom_history },
+     { "sio_state",         handle_sio_state },
++    { "host_mouse",        handle_host_mouse },
++    { "host_key",          handle_host_key },
+     { "mc_status",         handle_mc_status },
+     { "spu_status",        handle_spu_status },
+     { "spu_voices",        handle_spu_voices },

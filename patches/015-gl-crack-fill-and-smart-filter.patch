@@ -1,0 +1,705 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index fef56a32..81420b22 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -105,6 +105,8 @@
+ #define PSXGL_COMPILE_STATUS        0x8B81
+ #define PSXGL_LINK_STATUS           0x8B82
+ #define PSXGL_TEXTURE0              0x84C0
++#define PSXGL_TEXTURE1              0x84C1
++#define PSXGL_RGBA32F               0x8814
+ #define PSXGL_ARRAY_BUFFER          0x8892
+ #define PSXGL_STREAM_DRAW           0x88E0
+ #define PSXGL_FRAMEBUFFER           0x8D40
+@@ -383,7 +385,7 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
+  * fragment shader read the noperspective varying — i.e. bit-identical to the
+  * pre-feature pipeline. */
+-#define TEXV 20
++#define TEXV 21   /* +1: a_nbrec (cross-tile blend record) */
+ static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
+ static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
+
+@@ -398,6 +400,7 @@ static float   s_pq[3];
+
+ /* TEX program uniforms. */
+ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
++static GLint s_uNb = -1;
+ static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+ static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
+ static GLint s_uLimits = -1;
+@@ -1061,6 +1064,7 @@ static const char *TEX_VS =
+     "layout(location=7) in vec4 a_limits;\n"
+     "layout(location=8) in float a_semi;\n"
+     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
++    "layout(location=10) in float a_nbrec; /* row of this quad's neighbour record; 0 = none */\n"
+     "uniform float u_shift;\n"
+     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
+     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
+@@ -1071,10 +1075,14 @@ static const char *TEX_VS =
+     "flat out int v_persp;\n"
+     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
+     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
++    "flat out int v_filt;    /* 0 nearest, 1 bilinear, 2 edge-directed (a_raw bits 1..) */\n"
++    "flat out int v_nbrec;\n"
+     "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
+     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
+-    "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
++    "  v_depth = int(a_depth + 0.5);\n"
++    "  { int rb = int(a_raw + 0.5); v_raw = rb & 1; v_filt = rb >> 1; }\n"
++    "  v_nbrec = int(a_nbrec + 0.5);\n"
+     "  v_semi = int(a_semi + 0.5);\n"
+     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
+     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
+@@ -1103,7 +1111,10 @@ static const char *TEX_FS =
+     "flat in int v_raw;       /* 1 = no color modulation */\n"
+     "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
+     "flat in int v_semi;      /* GP0 command has semi-transparency enabled */\n"
++    "flat in int v_filt;      /* per-prim filter: 0 nearest, 1 bilinear, 2 edge-directed */\n"
++    "flat in int v_nbrec;     /* neighbour record row in u_nb; 0 = none */\n"
+     "uniform usampler2D u_vram;\n"
++    "uniform sampler2D u_nb;  /* per-quad neighbour records (RGBA32F, 24 texels per row) */\n"
+     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
+     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
+     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
+@@ -1121,8 +1132,17 @@ static const char *TEX_FS =
+     "    u = (u & ~(u_twin.x * 8)) | ((u_twin.z & u_twin.x) * 8);\n"
+     "    v = (v & ~(u_twin.y * 8)) | ((u_twin.w & u_twin.y) * 8);\n"
+     "  } else {\n"
+-    "    u = clamp(u, v_limits.x, v_limits.z);\n"
+-    "    v = clamp(v, v_limits.y, v_limits.w);\n"
++    "    /* u/v are already wrapped to 0..255. A coordinate that leaves the\n"
++    "     * prim's range by a fraction of a texel (sub-pixel vertices, perspective\n"
++    "     * interpolation, supersample positions: e.g. -0.01 -> floor -1 -> 255)\n"
++    "     * must land on the NEAR bound. A plain clamp sent it to the far one:\n"
++    "     * a line of wrong texels along the polygon border, or a hole where\n"
++    "     * that texel is the transparent colour 0. Pick the bound that is\n"
++    "     * closer on the 256-texel circle. */\n"
++    "    if (v_limits.x <= v_limits.z && (u < v_limits.x || u > v_limits.z))\n"
++    "      u = (((v_limits.x - u) & 255) <= ((u - v_limits.z) & 255)) ? v_limits.x : v_limits.z;\n"
++    "    if (v_limits.y <= v_limits.w && (v < v_limits.y || v > v_limits.w))\n"
++    "      v = (((v_limits.y - v) & 255) <= ((v - v_limits.w) & 255)) ? v_limits.y : v_limits.w;\n"
+     "  }\n"
+     "  if (v_depth == 0) {\n"
+     "    int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);\n"
+@@ -1136,13 +1156,166 @@ static const char *TEX_FS =
+     "vec3 col5(int raw){\n"
+     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+     "}\n"
++    "/* Edge-directed scaling for sprite-like prims: a freescale implementation of\n"
++    " * the xBR family (level 2: 45-degree, shallow and steep edges), written against\n"
++    " * this renderer's paletted VRAM fetch. Colour .a: 0 = transparent texel,\n"
++    " * 1 = opaque STP=0, 2 = opaque STP=1. */\n"
++    "vec4 xb_tex(int u, int v){\n"
++    "  int raw = fetch_texel(u, v);\n"
++    "  if (raw == 0) return vec4(0.0);\n"
++    "  return vec4(col5(raw), 1.0 + float((raw >> 15) & 1));\n"
++    "}\n"
++    "float xb_d(vec4 a, vec4 b){\n"
++    "  if (a.a == 0.0 || b.a == 0.0) return (a.a == b.a) ? 0.0 : 1000.0;\n"
++    "  vec3 c = (a.rgb - b.rgb) * 255.0;\n"
++    "  float y = dot(c, vec3(0.299, 0.587, 0.114));\n"
++    "  float cb = dot(c, vec3(-0.169, -0.331, 0.5));\n"
++    "  float cr = dot(c, vec3(0.5, -0.419, -0.081));\n"
++    "  if (a.a != b.a) return 1000.0; /* keep STP classes separate */\n"
++    "  return length(vec3(1.4 * y, cb, cr));\n"
++    "}\n"
++    "/* Perceptual near-colours belong to one shape; palette noise should not\n"
++    " * break its outline into little independent corners. */\n"
++    "bool xb_eq(vec4 a, vec4 b){ return xb_d(a, b) < 12.0; }\n"
++    "/* Smooth shading within a shape, not across its silhouette or STP class.\n"
++    " * Flat texel centres keep the chunky look. Only close shades mix near\n"
++    " * boundaries; high-contrast detail remains the edge scaler's job. */\n"
++    "void xb_shade_add(vec4 E, vec4 N, float weight, inout vec3 sum, inout float total){\n"
++    "  float gate = 1.0 - smoothstep(12.0, 40.0, xb_d(E, N));\n"
++    "  weight *= gate; sum += N.rgb * weight; total += weight;\n"
++    "}\n"
++    "/* One corner of texel E (the corner toward F and H, I diagonal). fp = position\n"
++    " * inside the texel measured toward F (x) and toward H (y), 0..1. Returns the\n"
++    " * blend weight; px = the colour that takes the corner. */\n"
++    "float xb_corner(vec4 E, vec4 F, vec4 H, vec4 I, vec4 B, vec4 D, vec4 C, vec4 G,\n"
++    "                vec4 F4, vec4 I4, vec4 H5, vec4 I5, vec2 fp, float aa, out vec4 px){\n"
++    "  px = E;\n"
++    "  if (xb_eq(E, F) && xb_eq(E, H)) return 0.0;\n"
++    "  float e = xb_d(E, C) + xb_d(E, G) + xb_d(I, H5) + xb_d(I, F4) + 4.0 * xb_d(H, F);\n"
++    "  float i = xb_d(H, D) + xb_d(H, I5) + xb_d(F, I4) + xb_d(F, B) + 4.0 * xb_d(E, I);\n"
++    "  if (!(e < i)) return 0.0;\n"
++    "  bool ok = (!xb_eq(F, B) && !xb_eq(H, D)) ||\n"
++    "            (xb_eq(E, I) && (!xb_eq(F, I4) && !xb_eq(H, I5))) ||\n"
++    "            xb_eq(E, G) || xb_eq(E, C);\n"
++    "  if (!ok) return 0.0;\n"
++    "  px = (xb_d(E, F) <= xb_d(E, H)) ? F : H;\n"
++    "  float ke = xb_d(F, G), ki = xb_d(H, C);\n"
++    "  bool shallow = (2.0 * ke <= ki) && !xb_eq(E, G) && !xb_eq(D, G);\n"
++    "  bool steep   = (ke >= 2.0 * ki) && !xb_eq(E, C) && !xb_eq(B, C);\n"
++    "  float s = fp.x + fp.y - 1.60;                       /* 45 degree cut */\n"
++    "  if (shallow) s = max(s, 0.5 * fp.x + fp.y - 1.06);  /* 2:1 toward G  */\n"
++    "  if (steep)   s = max(s, fp.x + 0.5 * fp.y - 1.06);  /* 1:2 toward C  */\n"
++    "  return smoothstep(-aa, aa, s);\n"
++    "}\n"
++    "vec4 xb_sample(vec2 uv){\n"
++    "  int u = int(floor(uv.x)), v = int(floor(uv.y));\n"
++    "  vec2 fp = uv - vec2(float(u), float(v));\n"
++    "  float aa = clamp(0.5 * (fwidth(uv.x) + fwidth(uv.y)), 0.06, 0.35);\n"
++    "  vec4 E = xb_tex(u, v);\n"
++    "  vec4 A = xb_tex(u-1, v-1), B = xb_tex(u, v-1), C = xb_tex(u+1, v-1);\n"
++    "  vec4 D = xb_tex(u-1, v),                       F = xb_tex(u+1, v);\n"
++    "  vec4 G = xb_tex(u-1, v+1), H = xb_tex(u, v+1), I = xb_tex(u+1, v+1);\n"
++    "  vec4 A1 = xb_tex(u-1, v-2), B1 = xb_tex(u, v-2), C1 = xb_tex(u+1, v-2);\n"
++    "  vec4 G5 = xb_tex(u-1, v+2), H5 = xb_tex(u, v+2), I5 = xb_tex(u+1, v+2);\n"
++    "  vec4 A0 = xb_tex(u-2, v-1), D0 = xb_tex(u-2, v), G0 = xb_tex(u-2, v+1);\n"
++    "  vec4 C4 = xb_tex(u+2, v-1), F4 = xb_tex(u+2, v), I4 = xb_tex(u+2, v+1);\n"
++    "  vec4 px, best = E; float w, wmax = 0.0;\n"
++    "  w = xb_corner(E, F, H, I, B, D, C, G, F4, I4, H5, I5, fp, aa, px);\n"
++    "  if (w > wmax) { wmax = w; best = px; }\n"
++    "  w = xb_corner(E, B, F, C, D, H, A, I, B1, C1, F4, C4, vec2(1.0 - fp.y, fp.x), aa, px);\n"
++    "  if (w > wmax) { wmax = w; best = px; }\n"
++    "  w = xb_corner(E, D, B, A, H, F, G, C, D0, A0, B1, A1, vec2(1.0 - fp.x, 1.0 - fp.y), aa, px);\n"
++    "  if (w > wmax) { wmax = w; best = px; }\n"
++    "  w = xb_corner(E, H, D, G, F, B, I, A, H5, G5, D0, G0, vec2(fp.y, 1.0 - fp.x), aa, px);\n"
++    "  if (w > wmax) { wmax = w; best = px; }\n"
++    "  if (E.a != best.a || E.a == 0.0) return (wmax > 0.5) ? best : E;   /* cutout/STP: hard edge */\n"
++    "  vec2 f = 0.5 * smoothstep(vec2(0.15), vec2(0.5), abs(fp - 0.5));\n"
++    "  vec4 nx = fp.x < 0.5 ? D : F, ny = fp.y < 0.5 ? B : H;\n"
++    "  vec4 nd = fp.x < 0.5 ? (fp.y < 0.5 ? A : G) : (fp.y < 0.5 ? C : I);\n"
++    "  float total = (1.0 - f.x) * (1.0 - f.y);\n"
++    "  vec3 shade = E.rgb * total;\n"
++    "  xb_shade_add(E, nx, f.x * (1.0 - f.y), shade, total);\n"
++    "  xb_shade_add(E, ny, (1.0 - f.x) * f.y, shade, total);\n"
++    "  xb_shade_add(E, nd, f.x * f.y, shade, total);\n"
++    "  return vec4(mix(shade / total, best.rgb, wmax), (wmax > 0.5) ? best.a : E.a);\n"
++    "}\n"
++    "/* Cross-tile blend. Bilinear filtering ramps every texel transition over one\n"
++    " * texel - except at a quad's border, where the texel beyond belongs to another\n"
++    " * quad's tile somewhere else in the atlas, so sampling clamps and the picture\n"
++    " * changes on a hard line. Here the colour the NEIGHBOURING quad shows at the\n"
++    " * shared edge (its texture, bilinear along the edge, times its own vertex\n"
++    " * lighting) is mixed in over the last `band` texels before the border, weight\n"
++    " * 0 at the band's start and 1/2 at the border. Both quads compute the same\n"
++    " * 50/50 mix at the edge, so texture and lighting are continuous across it,\n"
++    " * symmetric and independent of draw order. */\n"
++    "int nb_fetch(ivec2 tp, ivec2 cl, int depth, ivec4 lim, int u, int v){\n"
++    "  u = clamp(u, lim.x, lim.z); v = clamp(v, lim.y, lim.w);\n"
++    "  if (depth == 0) {\n"
++    "    int px = vram_at(tp.x + (u >> 2), tp.y + v);\n"
++    "    return vram_at(cl.x + ((px >> ((u & 3) * 4)) & 0xF), cl.y);\n"
++    "  } else if (depth == 1) {\n"
++    "    int px = vram_at(tp.x + (u >> 1), tp.y + v);\n"
++    "    return vram_at(cl.x + ((px >> ((u & 1) * 8)) & 0xFF), cl.y);\n"
++    "  }\n"
++    "  return vram_at(tp.x + u, tp.y + v);\n"
++    "}\n"
++    "bool nb_bilinear(ivec2 tp, ivec2 cl, int depth, ivec4 lim, vec2 uv, out vec3 rgb){\n"
++    "  uv += vec2(u_shift);\n"
++    "  int iu = int(floor(uv.x)), iv = int(floor(uv.y));\n"
++    "  float fx = uv.x - float(iu) - 0.5, fy = uv.y - float(iv) - 0.5;\n"
++    "  int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
++    "  fx = abs(fx); fy = abs(fy);\n"
++    "  int c00 = nb_fetch(tp, cl, depth, lim, iu, iv);\n"
++    "  if (c00 == 0) return false;\n"
++    "  int c10 = nb_fetch(tp, cl, depth, lim, iu + sx, iv);\n"
++    "  int c01 = nb_fetch(tp, cl, depth, lim, iu, iv + sy);\n"
++    "  int c11 = nb_fetch(tp, cl, depth, lim, iu + sx, iv + sy);\n"
++    "  float w00 = (1.0 - fx) * (1.0 - fy);\n"
++    "  float w10 = (c10 == 0 ? 0.0 : 1.0) * fx * (1.0 - fy);\n"
++    "  float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
++    "  float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
++    "  rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / (w00 + w10 + w01 + w11);\n"
++    "  return true;\n"
++    "}\n"
++    "vec3 nb_blend(vec3 own, vec2 uv){\n"
++    "  for (int side = 0; side < 4; side++) {\n"
++    "    int base = side * 6;\n"
++    "    vec4 t2 = texelFetch(u_nb, ivec2(base + 2, v_nbrec), 0);   /* valid, depth, aP, aQ */\n"
++    "    if (t2.x < 0.5) continue;\n"
++    "    vec4 t3 = texelFetch(u_nb, ivec2(base + 3, v_nbrec), 0);   /* light P rgb, border coord */\n"
++    "    vec4 t4 = texelFetch(u_nb, ivec2(base + 4, v_nbrec), 0);   /* light Q rgb, band texels */\n"
++    "    float d = (side == 0) ? uv.x - t3.w : (side == 1) ? t3.w - uv.x\n"
++    "            : (side == 2) ? uv.y - t3.w : t3.w - uv.y;\n"
++    "    float band = t4.w;\n"
++    "    if (d >= band || band <= 0.0) continue;\n"
++    "    float along = (side < 2) ? uv.y : uv.x;\n"
++    "    float den = t2.w - t2.z;\n"
++    "    if (abs(den) < 0.5) continue;\n"
++    "    float t = clamp((along - t2.z) / den, 0.0, 1.0);\n"
++    "    vec4 t0 = texelFetch(u_nb, ivec2(base, v_nbrec), 0);       /* tpage xy, clut xy */\n"
++    "    vec4 t1 = texelFetch(u_nb, ivec2(base + 1, v_nbrec), 0);   /* neighbour uv at P, at Q */\n"
++    "    vec4 t5 = texelFetch(u_nb, ivec2(base + 5, v_nbrec), 0);   /* neighbour texel limits */\n"
++    "    vec3 nrgb;\n"
++    "    if (!nb_bilinear(ivec2(t0.xy + 0.5), ivec2(t0.zw + 0.5), int(t2.y + 0.5),\n"
++    "                     ivec4(t5 + 0.5), mix(t1.xy, t1.zw, t), nrgb)) continue;\n"
++    "    if (v_raw == 0) nrgb = clamp(nrgb * mix(t3.rgb, t4.rgb, t) * 2.0, 0.0, 1.0);\n"
++    "    own = mix(own, nrgb, 0.5 * (1.0 - max(d, 0.0) / band));\n"
++    "  }\n"
++    "  return own;\n"
++    "}\n"
+     "void main(){\n"
+     "  int stp; vec3 rgb;\n"
+     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
+     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
+     "   * default is the PS1's affine (noperspective) mapping. */\n"
+     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+-    "  if (u_filter == 0) {\n"
++    "  int filt = (u_filter != 0) ? 1 : v_filt;   /* global bilinear wins */\n"
++    "  if (filt == 2) {\n"
++    "    vec4 c = xb_sample(uv);\n"
++    "    if (c.a == 0.0) discard;\n"
++    "    rgb = c.rgb;\n"
++    "    stp = c.a > 1.5 ? 1 : 0;\n"
++    "  } else if (filt == 0) {\n"
+     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+     "    if (raw == 0) discard;\n"
+     "    rgb = col5(raw);\n"
+@@ -1178,6 +1351,7 @@ static const char *TEX_FS =
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
+     "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
++    "  if (v_nbrec > 0) rgb = nb_blend(rgb, uv);\n"
+     "  float dst_factor = 0.0;\n"
+     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+@@ -1778,6 +1952,42 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
+  * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
+  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
+  * whose two passes do not self-overlap. */
++/* Cross-tile blend records (see nb_blend in TEX_FS). gpu.c describes, for the
++ * quad it is about to draw, what each of its four borders joins onto; the
++ * record rides in a float texture row and the vertex carries the row index. */
++#define NB_REC_FLOATS 96                    /* 4 sides x 6 RGBA32F texels */
++#define NB_MAX_RECS   2048
++static float  s_nb_data[NB_MAX_RECS * NB_REC_FLOATS];
++static int    s_nb_count = 1;               /* row 0 = "no neighbours" */
++static float  s_nb_pending[NB_REC_FLOATS];
++static int    s_nb_pending_valid = 0, s_nb_pending_row = 0;
++static GLuint s_nb_tex = 0;
++
++void gl_renderer_set_quad_neighbours(const float *rec) {
++    s_nb_pending_valid = rec != NULL;
++    s_nb_pending_row = 0;
++    if (rec) memcpy(s_nb_pending, rec, sizeof(s_nb_pending));
++}
++
++static void nb_bind_and_upload(void) {
++    p_glActiveTexture(PSXGL_TEXTURE1);
++    if (!s_nb_tex) {
++        glGenTextures(1, &s_nb_tex);
++        glBindTexture(GL_TEXTURE_2D, s_nb_tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_RGBA32F, NB_REC_FLOATS / 4, NB_MAX_RECS, 0,
++                     GL_RGBA, GL_FLOAT, NULL);
++    } else {
++        glBindTexture(GL_TEXTURE_2D, s_nb_tex);
++    }
++    if (s_nb_count > 1)
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, NB_REC_FLOATS / 4, s_nb_count,
++                        GL_RGBA, GL_FLOAT, s_nb_data);
++    p_glUniform1i(s_uNb, 1);
++    p_glActiveTexture(PSXGL_TEXTURE0);
++}
++
+ static void tex_batch_draw_passes(int nverts, int semi) {
+     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+     if (semi < 0) {
+@@ -1866,6 +2076,9 @@ static void flush_tex_batch(void) {
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex);
+     p_glUniform1i(s_uVram, 0);
++    nb_bind_and_upload();
++    s_nb_count = 1;                        /* rows are per batch */
++    s_nb_pending_row = 0;
+     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
+     p_glUniform1i(s_uMaskset, s_tb_mask);
+     p_glUniform1i(s_uFilter, s_tb_filter);
+@@ -1951,6 +2164,113 @@ static void flush_flat_batch(void) {
+     hr_end();
+ }
+
++/* Crack fill (PSX_GL_CRACK_FILL=<native pixels>, default 0 = off).
++ *
++ * With sub-pixel vertex positions and a supersampled target, meshes that were
++ * never watertight show it: a vertex that lies 0.1-0.7 px beside a neighbour's
++ * edge (T-junctions, the same corner projected twice with different rounding)
++ * leaves a hairline of background. Stock hardware hides that inside one pixel.
++ * Tracking cannot fix it - the positions really differ - so close it where it
++ * is drawn: every OPAQUE triangle that carries sub-pixel positions (projected
++ * world geometry; 2D/UI prims never do) is grown outward by `d` pixels, each
++ * edge moved along its normal. Attributes are re-evaluated at the moved
++ * corners with the original triangle's barycentrics, so the texture/shading
++ * inside the original outline is unchanged and the rim continues it; uv
++ * sampling stays inside the prim's own limits. Semi-transparent prims are left
++ * alone (an overlap would blend twice). Later prims simply paint over the rim,
++ * as painter's order intends. */
++static float s_crack_fill = -1.0f;
++
++static float crack_fill_px(void) {
++    if (s_crack_fill < 0.0f) {
++        const char *e = getenv("PSX_GL_CRACK_FILL");
++        float v = (e && *e) ? (float)atof(e) : 0.0f;
++        s_crack_fill = (v > 0.0f && v <= 2.0f) ? v : 0.0f;
++    }
++    return s_crack_fill;
++}
++
++/* Rim width for one prim. The gaps are not uniform: geometry near the camera
++ * is where the game subdivides and clips, and where the GTE's fixed-point error
++ * is largest on screen - close terrain keeps 1-2 px gaps with a flat 0.35
++ * (two rims = 0.7 px) while distant meshes are closed. Depth is
++ * not available here (q is normalised per prim), so on-screen size stands in:
++ * the base width up to a 32 px longest edge, rising linearly to the near width
++ * (PSX_GL_CRACK_FILL_NEAR, default 1.2) at 112 px. A corner that sits on an
++ * exact whole pixel is the game's screen-space clipper output (rounded, up to
++ * ~0.7 px off the true edge): such a prim gets at least 1.0. (A first tuning,
++ * 48..128 px / 0.85 / 0.75, still left a few gaps on close geometry.) */
++static float crack_fill_amount(const float *x, const float *y) {
++    static float s_near = -1.0f;
++    float base = crack_fill_px();
++    if (base <= 0.0f) return 0.0f;
++    if (s_near < 0.0f) {
++        const char *e = getenv("PSX_GL_CRACK_FILL_NEAR");
++        float v = (e && *e) ? (float)atof(e) : 1.2f;
++        s_near = (v >= 0.0f && v <= 2.0f) ? v : 1.2f;
++    }
++    float near_w = s_near > base ? s_near : base;
++    float l2 = 0.0f;
++    int whole = 0;
++    for (int i = 0; i < 3; i++) {
++        int j = (i + 1) % 3;
++        float ex = x[j] - x[i], ey = y[j] - y[i];
++        float e2 = ex * ex + ey * ey;
++        if (e2 > l2) l2 = e2;
++        if (x[i] == floorf(x[i]) && y[i] == floorf(y[i])) whole = 1;
++    }
++    float len = sqrtf(l2);
++    float t = (len - 32.0f) / 80.0f;
++    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
++    float d = base + (near_w - base) * t;
++    if (whole && d < 1.0f && near_w >= 1.0f) d = 1.0f;
++    return d;
++}
++
++/* in: x/y[3]. out: nx/ny[3] grown by d, w[i][j] = barycentric weight of
++ * original corner j at grown corner i. Returns 0 (and leaves outputs alone)
++ * for a degenerate triangle. */
++static int crack_fill_grow(const float *x, const float *y, const float *d,
++                           float *nx, float *ny, float w[3][3]) {
++    float area2 = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
++    if (fabsf(area2) < 1e-3f) return 0;
++    float sgn = area2 > 0.0f ? 1.0f : -1.0f;
++    float enx[3], eny[3];                  /* outward unit normal of edge i -> i+1 */
++    for (int i = 0; i < 3; i++) {
++        int j = (i + 1) % 3;
++        float ex = x[j] - x[i], ey = y[j] - y[i];
++        float len = sqrtf(ex * ex + ey * ey);
++        if (len < 1e-4f) return 0;
++        enx[i] = sgn * ey / len;
++        eny[i] = -sgn * ex / len;
++    }
++    for (int i = 0; i < 3; i++) {
++        int p = (i + 2) % 3;               /* edges p (into i) and i (out of i) */
++        /* The corner moves to where the two offset edges meet: X - P = a*np + b*ni
++         * with np.(X-P) = d[p] and ni.(X-P) = d[i]. Equal widths reduce to the
++         * miter d*(np+ni)/(1+c). A sliver corner (c -> -1) caps the miter. */
++        float c = enx[p] * enx[i] + eny[p] * eny[i];
++        float det = 1.0f - c * c;
++        float a, bq;
++        if (det < 0.06f) {
++            float k = 1.0f + c;
++            if (k < 0.25f) k = 0.25f;
++            a = bq = 0.5f * (d[p] + d[i]) / k;
++        } else {
++            a  = (d[p] - c * d[i]) / det;
++            bq = (d[i] - c * d[p]) / det;
++        }
++        nx[i] = x[i] + a * enx[p] + bq * enx[i];
++        ny[i] = y[i] + a * eny[p] + bq * eny[i];
++    }
++    for (int i = 0; i < 3; i++) {
++        float w1 = ((nx[i] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (ny[i] - y[0])) / area2;
++        float w2 = ((x[1] - x[0]) * (ny[i] - y[0]) - (nx[i] - x[0]) * (y[1] - y[0])) / area2;
++        w[i][0] = 1.0f - w1 - w2; w[i][1] = w1; w[i][2] = w2;
++    }
++    return 1;
++}
++
+ /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
+  * or GL_LINES; verts are (x, y, r, g, b, a) tuples with colors as 1555. */
+ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+@@ -2002,21 +2322,32 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+
+     if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
+         flush_flat_batch();
+-    if (s_fb_n + n > FLATBATCH_MAXV)
++    if (s_fb_n + 2 * n > FLATBATCH_MAXV)   /* 2x: crack-fill under-layer */
+         flush_flat_batch();
+     s_fb_semi = semi;
+     s_fb_mask = (int)s_mask_set;
+
+     float mask_a = s_mask_set ? 1.0f : 0.0f;
+-    for (int i = 0; i < n; i++) {
+-        float *v = &s_fb[s_fb_n * 6];
+-        v[0] = precise ? s_pc_x[i] : (float)xs[i];
+-        v[1] = precise ? s_pc_y[i] : (float)ys[i];
+-        v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
+-        v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
+-        v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+-        v[5] = mask_a;
+-        s_fb_n++;
++    float gx[3], gy[3], gw[3][3];
++    const float flat_w = crack_fill_amount(s_pc_x, s_pc_y);
++    const float flat_d[3] = { flat_w, flat_w, flat_w };
++    const int grown = precise && semi < 0 && crack_fill_px() > 0.0f &&
++                      crack_fill_grow(s_pc_x, s_pc_y, flat_d, gx, gy, gw);
++    /* Same under-layer form as the textured path: grown copy, then the prim. */
++    for (int layer = grown ? 0 : 1; layer < 2; layer++) {
++        for (int i = 0; i < n; i++) {
++            float *v = &s_fb[s_fb_n * 6];
++            if (layer == 0) { v[0] = gx[i]; v[1] = gy[i]; }
++            else {
++                v[0] = precise ? s_pc_x[i] : (float)xs[i];
++                v[1] = precise ? s_pc_y[i] : (float)ys[i];
++            }
++            v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
++            v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
++            v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
++            v[5] = mask_a;
++            s_fb_n++;
++        }
+     }
+ }
+
+@@ -2037,6 +2368,76 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
+  * implementation for GL/VK/SW, see gpu_uv.h. */
+ #include "gpu_uv.h"
+
++/* Smart texture filter (PSX_GL_SMART_FILTER=1; off = the single global filter).
++ * One filter does not suit a PS1 3D game: bilinear is right for the tiled world
++ * textures and for photographic images, and wrong for sprites, whose cut-out
++ * outlines and hand-drawn detail it turns to mush, while an edge-directed scaler
++ * is right for sprites and wrong for noisy world textures. The mode is decided
++ * per prim from what the prim is and travels in the vertex (no batch split):
++ *   Gouraud-textured polygons (Disruptor terrain, including clipped tris)
++ *                                                              -> bilinear
++ *   true-colour (15-bit) textures and the widescreen backdrop   -> bilinear
++ *   other projected, non-billboard geometry                    -> bilinear
++ *   billboards, pickups, weapon, HUD, text                     -> edge-directed
++ * Terrain is identified by its draw entry point, not PGXP availability or
++ * screen alignment: those vary as the camera moves and used to send head-on
++ * terrain through the sprite filter. The shape/depth fallback applies only
++ * to the remaining flat-textured polygons and rectangles. */
++static int smart_filter_on(void) {
++    static int s = -1;
++    if (s < 0) {
++        const char *e = getenv("PSX_GL_SMART_FILTER");
++        s = (e && *e && *e != '0') ? 1 : 0;
++    }
++    return s;
++}
++
++/* Primitive kind is supplied by the draw entry point: 0 flat-textured
++ * polygon, 1 Gouraud-textured polygon, 2 textured rectangle. */
++static int smart_filter_mode(const int *xs, const int *ys, int depth, int backdrop, int kind) {
++    if (!smart_filter_on()) return 0;
++    if (kind == 1 || depth >= 2 || backdrop) return 1;
++    int horiz = 0, vert = 0;
++    for (int i = 0; i < 3; i++) {
++        int j = (i + 1) % 3;
++        if (ys[i] == ys[j] && xs[i] != xs[j]) horiz = 1;
++        if (xs[i] == xs[j] && ys[i] != ys[j]) vert = 1;
++    }
++    int flat_depth = !s_pq_valid ||
++        (fabsf(s_pq[0] - s_pq[1]) < 0.005f && fabsf(s_pq[1] - s_pq[2]) < 0.005f);
++    if (s_pc_valid && !(horiz && vert && flat_depth)) return 1;
++    return 2;
++}
++
++/* Opt-in, bounded per-frame filter census. No per-vertex file writes.
++ * Counts the actual mode sent to the shader, by stable draw entry point. */
++static void smart_filter_note(int kind, int mode) {
++    static int enabled = -1;
++    static uint32_t frame, lines;
++    static unsigned counts[3][3], missing_position, axis_aligned;
++    if (enabled < 0) {
++        const char *e = getenv("PSX_GL_FILTER_CENSUS");
++        enabled = e && *e && *e != '0';
++    }
++    if (!enabled || lines >= 4096) return;
++    uint32_t now = (uint32_t)s_frame_count;
++    if (now != frame) {
++        fprintf(stderr, "filter_census frame=%u flat=%u,%u,%u shaded=%u,%u,%u rect=%u,%u,%u missing=%u aligned=%u\n",
++                (unsigned)frame, counts[0][0], counts[0][1], counts[0][2],
++                counts[1][0], counts[1][1], counts[1][2],
++                counts[2][0], counts[2][1], counts[2][2], missing_position, axis_aligned);
++        memset(counts, 0, sizeof(counts));
++        missing_position = axis_aligned = 0;
++        frame = now;
++        lines++;
++    }
++    counts[kind][mode]++;
++    if (kind == 1 && mode == 2) {
++        if (!s_pc_valid) missing_position++;
++        else axis_aligned++;
++    }
++}
++
+ /* Textured triangle. Always two passes split by the per-texel STP bit so the
+  * stencil (mask) write value is constant within each pass; the semi pass is
+  * also where PS1 blending applies. lim = uv sampling bounds (see
+@@ -2045,7 +2446,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+                                   const int *us, const int *vs,
+                                   const float *col, uint16_t texpage,
+                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
+-                                  int semi, const int *lim) {
++                                  int semi, const int *lim, int kind) {
+     int lim_buf[4];
+     int uv_buf[6];
+     if (!lim) {
+@@ -2119,27 +2520,86 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+             s_batch_reason[reason]++;
+             flush_tex_batch();
+         }
+-        if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
++        if (s_tb_n + 6 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); } /* 6: crack-fill under-layer */
++        if (s_nb_pending_valid && !s_nb_pending_row && s_nb_count >= NB_MAX_RECS) flush_tex_batch();
+         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
+             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
+             s_tb_bank_tex = s_selected_bank_tex;
+             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+         }
+         float *vp = &s_tb[s_tb_n * TEXV];
+-        for (int i = 0; i < 3; i++, vp += TEXV) {
+-            vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
+-            vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+-            vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+-            vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
+-            vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
+-            vp[10] = (float)clut_x;  vp[11] = (float)clut_y;        /* a_clut   */
+-            vp[12] = (float)depth;   vp[13] = (float)rawtex;        /* a_depth, a_raw */
+-            vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
+-            vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+-            vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
+-            vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
++        /* Crack fill, under-layer form: first the prim grown outward, carrying
++         * the ORIGINAL corner attributes (its mapping is stretched by the rim
++         * width, which only ever shows inside a gap or as the rim), then the
++         * prim itself, untouched, on top. The exact prim is therefore drawn
++         * exactly as without the fill, and every opaque sub-pixel prim gets a
++         * rim - extending a perspective mapping outward instead (tried) has no
++         * valid result for prims spanning a steep depth range, i.e. precisely
++         * the close-up terrain, which then stayed open. */
++        float gx[3], gy[3], gw[3][3];
++        const int filt_mode = smart_filter_mode(xs, ys, depth, gate, kind);
++        smart_filter_note(kind, s_tex_filter ? 1 : filt_mode);
++        /* Both triangles of a quad share one neighbour record (a flush in
++         * between resets the row, and the record is simply stored again). */
++        int nb_row = 0;
++        if (s_nb_pending_valid && filt_mode == 1 && semi < 0) {
++            if (!s_nb_pending_row) {
++                memcpy(&s_nb_data[s_nb_count * NB_REC_FLOATS], s_nb_pending, sizeof(s_nb_pending));
++                s_nb_pending_row = s_nb_count++;
++            }
++            nb_row = s_nb_pending_row;
++        }
++        /* Rim width per edge. A border with a blend neighbour needs none: the two
++         * quads were matched by identical corner position words, so there is no
++         * crack between them, and a rim there lays a flat stripe over the
++         * neighbour's blend ramp (seen as fat, doubled lines). The quad's inner
++         * diagonal needs none either. Everything else - T-junctions, mesh
++         * borders, prims without a record - keeps the full rim. */
++        float ed[3];
++        {
++            const float w = crack_fill_amount(s_pc_x, s_pc_y);
++            for (int i = 0; i < 3; i++) {
++                int j = (i + 1) % 3;
++                ed[i] = w;
++                if (!nb_row) continue;
++                int du = abs(us[i] - us[j]), dv = abs(vs[i] - vs[j]);
++                if (du > 1 && dv > 1) { ed[i] = 0.0f; continue; }        /* inner diagonal */
++                for (int side = 0; side < 4; side++) {
++                    const float *r = &s_nb_pending[side * 24];
++                    if (r[8] < 0.5f) continue;
++                    float border = r[15];
++                    const int *cc = side < 2 ? us : vs;
++                    if (fabsf((float)cc[i] - border) <= 1.0f && fabsf((float)cc[j] - border) <= 1.0f)
++                        ed[i] = 0.0f;
++                }
++            }
++        }
++        const int grown = s_pc_valid && semi < 0 && crack_fill_px() > 0.0f &&
++                          (ed[0] > 0.0f || ed[1] > 0.0f || ed[2] > 0.0f) &&
++                          crack_fill_grow(s_pc_x, s_pc_y, ed, gx, gy, gw);
++        for (int layer = grown ? 0 : 1; layer < 2; layer++) {
++            for (int i = 0; i < 3; i++, vp += TEXV) {
++                if (layer == 0) { vp[0] = gx[i]; vp[1] = gy[i]; }
++                else {
++                    vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
++                    vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
++                }
++                vp[2] = (float)us[i];   vp[3] = (float)vs[i];
++                vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
++                vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
++                vp[10] = (float)clut_x;  vp[11] = (float)clut_y;        /* a_clut   */
++                vp[12] = (float)depth;                                   /* a_depth */
++                vp[13] = (float)((rawtex ? 1 : 0) + 2 * filt_mode);      /* a_raw: bit0 raw, bits1.. filter */
++                vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
++                vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
++                vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
++                vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
++                /* a_nbrec, on the rim copy too: outside the border the blend weight is
++                 * 1/2, i.e. the rim shows exactly the border colour both quads agree on. */
++                vp[20] = (float)nb_row;
++            }
++            s_tb_n += 3;
+         }
+-        s_tb_n += 3;
+         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
+     }
+ }
+@@ -2232,10 +2692,10 @@ static void gpu_textured_rect(int x,int y,int w,int h,
+     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
+     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
+     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
+-    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
++    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim,2);
+     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
+     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
+-    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
++    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim,2);
+ }
+
+ /* GP0(02h) fill: writes color with bit15=0, ignoring draw area, mask and
+@@ -2445,7 +2905,7 @@ static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1
+     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
+     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
+     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
+-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL);
++    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL,0);
+     precise_consumed();
+ }
+ static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
+@@ -2455,7 +2915,7 @@ static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
+     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
+     uint32_t cc[3]={c0,c1,c2}; float col[9];
+     for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
+-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL);
++    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL,1);
+     precise_consumed();
+ }
+ static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
+@@ -2868,6 +3328,7 @@ static int init_gpu_raster(void) {
+     if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
+
+     s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
++    s_uNb    = p_glGetUniformLocation(s_tex_prog, "u_nb");
+     s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+     s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
+     s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
+@@ -2952,6 +3413,7 @@ static int init_gpu_raster(void) {
+         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
+         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
+         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
++        p_glVertexAttribPointer(10, 1, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* nbrec */
+     }
+
+     p_glGenVertexArrays(1, &s_blit_vao);

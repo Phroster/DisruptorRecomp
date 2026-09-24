@@ -1,0 +1,189 @@
+diff --git a/runtime/include/psx_cycles.h b/runtime/include/psx_cycles.h
+index e2e0cbf1..4c0fd832 100644
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -68,8 +68,28 @@ extern uint32_t *g_psx_cyc_local_acc;
+ 
+ /* Advance guest time. Overlay DLLs forward this through their callback shim;
+  * normal runtime/generated code keeps the common production path inlined. */
++/* Guest CPU overclock (percent, 100 = stock 33.8688 MHz). CPU work charged
++ * through psx_advance_cycles() is scaled by 100/percent before it reaches the
++ * guest clock, so the CPU retires percent/100 as many instructions per VBlank
++ * while every device (VBlank, timers, SPU sample rate, CD) keeps stock time.
++ * A 30 fps engine forced to draw every VBlank (a 60 fps mod) needs this when
++ * its frame does not fit in one stock VBlank of CPU time. Absolute waits
++ * (stalls to a GTE/muldiv completion stamp, idle skips, load acceleration)
++ * use psx_advance_cycles_raw() and are never scaled. The remainder carries
++ * so long-run totals are exact. PSX_CPU_OVERCLOCK=<100..400> in the env. */
++extern uint32_t psx_cpu_oc_percent;   /* 100 = off */
++extern uint64_t psx_cpu_oc_rem;
++static inline uint32_t psx_cpu_oc_scale(uint32_t cycles) {
++    uint64_t t;
++    if (psx_cpu_oc_percent == 100u) return cycles;
++    t = (uint64_t)cycles * 100u + psx_cpu_oc_rem;
++    psx_cpu_oc_rem = t % psx_cpu_oc_percent;
++    return (uint32_t)(t / psx_cpu_oc_percent);
++}
++
+ #if defined(PSX_OVERLAY_DLL_BUILD)
+ void psx_advance_cycles(uint32_t cycles);
++void psx_advance_cycles_raw(uint32_t cycles);
+ #else
+ /* The common production path is inlined: bump the
+  * counter and only service devices when the next event deadline is due.
+@@ -79,6 +99,11 @@ void psx_advance_cycles(uint32_t cycles);
+  * on the HARD_CAP / event cadence, ≥ every 16K guest cycles) — not on every
+  * per-instruction charge. MotK VLC issues millions of advances/s; two add+
+  * branch pairs there were pure host tax. */
++/* Unscaled advance: the argument is already in guest-clock cycles (an
++ * absolute distance to a device or completion deadline). Pending CPU batch
++ * charges are published (scaled) first so ordering is preserved. */
++static inline void psx_advance_cycles_raw(uint32_t cycles);
++
+ static inline void psx_advance_cycles(uint32_t cycles) {
+ #if !defined(PSX_COSIM)
+     if (g_psx_cyc_batch) {
+@@ -88,6 +113,27 @@ static inline void psx_advance_cycles(uint32_t cycles) {
+         if (cycles <= UINT32_MAX - b) cycles += b;
+         else {
+             /* Extreme: publish b first, then continue with cycles. */
++            psx_cycle_count += (uint64_t)psx_cpu_oc_scale(b);
++            if (!psx_in_device_service &&
++                (psx_next_service_cycle == 0u ||
++                 psx_cycle_count >= psx_next_service_cycle)) {
++                psx_devices_service_to_now();
++            }
++        }
++    }
++#endif
++    psx_advance_cycles_raw(psx_cpu_oc_scale(cycles));
++}
++
++static inline void psx_advance_cycles_raw(uint32_t cycles) {
++#if !defined(PSX_COSIM)
++    if (g_psx_cyc_batch) {
++        uint32_t b = g_psx_cyc_batch;
++        g_psx_cyc_batch = 0;
++        g_psx_cyc_batch_limit = 0;
++        b = psx_cpu_oc_scale(b);
++        if (cycles <= UINT32_MAX - b) cycles += b;
++        else {
+             psx_cycle_count += (uint64_t)b;
+             if (!psx_in_device_service &&
+                 (psx_next_service_cycle == 0u ||
+diff --git a/runtime/src/load_accel.c b/runtime/src/load_accel.c
+index 3a43a141..6f72e47f 100644
+--- a/runtime/src/load_accel.c
++++ b/runtime/src/load_accel.c
+@@ -160,7 +160,7 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
+             if (cd > 64u && cd != 0xFFFFFFFFu) dist = cd;
+         }
+         if (dist > 64u && dist != 0xFFFFFFFFu && dist <= 1200000u) {
+-            psx_advance_cycles(dist);
++            psx_advance_cycles_raw(dist);
+             if (horizon_kind == 2) {
+                 s_extra_horizon_hits++;
+                 s_extra_horizon_cycles += dist;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 4d2113cf..6fa705ad 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -32,6 +32,7 @@
+ #include "autocompile.h"
+ #include "code_provider.h"
+ extern "C" void psx_event_step_conservative_env_init(void);
++extern "C" void psx_cpu_overclock_env_init(void);
+ #include "overlay_backend.h"
+ #include "gpu.h"
+ #include "display_scanout.h"
+@@ -14945,6 +14946,7 @@ session_reboot:
+     interrupts_init();
+     sio_init();
+     psx_event_step_conservative_env_init();
++    psx_cpu_overclock_env_init();
+     /* Seed per-player device routing from the resolved [controller] config.
+      * SDL controller handles are opened later (after SDL_Init); here we only
+      * set the PSX-visible connection + pad type so the BIOS sees the right
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 6859c461..948b1530 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -2,6 +2,7 @@
+ 
+ #include "psx_cycles.h"
+ #include "cpu_state.h"
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #if defined(_MSC_VER)
+@@ -73,6 +74,26 @@ void psx_event_step_conservative_env_init(void) {
+     if (e && e[0] == '1') g_event_step_conservative = 1;
+ }
+ 
++/* Guest CPU overclock (see psx_cycles.h). */
++uint32_t psx_cpu_oc_percent = 100u;
++uint64_t psx_cpu_oc_rem = 0u;
++
++void psx_cpu_overclock_env_init(void) {
++    const char *e = getenv("PSX_CPU_OVERCLOCK");
++    long v;
++    if (!e || !e[0]) return;
++    v = atol(e);
++    if (v < 100 || v > 400) {
++        fprintf(stdout, "psxrecomp: PSX_CPU_OVERCLOCK=%s ignored (use 100..400)\n", e);
++        return;
++    }
++    psx_cpu_oc_percent = (uint32_t)v;
++    psx_cpu_oc_rem = 0u;
++    if (v != 100)
++        fprintf(stdout, "psxrecomp: guest CPU overclock %ld%% (%.1f MHz equivalent)\n",
++                v, 33.8688 * (double)v / 100.0);
++}
++
+ static void advance_devices(uint32_t c) {
+     psx_cycle_count += (uint64_t)c;
+     sio_advance(c);
+@@ -552,7 +573,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
+     g_idle_skip_cycles += skip;
+     g_idle_skip_last_pc = check_pc;
+     g_idle_skip_last_quantum = q;
+-    psx_advance_cycles((uint32_t)skip);  /* replays device events exactly */
++    psx_advance_cycles_raw((uint32_t)skip);  /* replays device events exactly */
+ 
+     /* Device servicing may have written RAM / raised I_STAT — the caller
+      * (psx_check_interrupts) evaluates deliverability right after this with
+@@ -693,7 +714,7 @@ void psx_muldiv_stall(CPUState* cpu) {
+         uint8_t w = cpu->read_absorb_which;          /* fixed during the stall */
+         uint32_t give = cpu->read_absorb[w];
+         cpu->read_absorb[w] = (uint8_t)(give > stall ? give - stall : 0u);  /* consume */
+-        psx_advance_cycles(stall);
++        psx_advance_cycles_raw(stall);
+     }
+ }
+ 
+@@ -710,7 +731,7 @@ void psx_gte_read(CPUState* cpu, uint32_t rt) {
+     if (cpu->gte_ts_done > psx_cycle_count) {
+         uint32_t stall = (uint32_t)(cpu->gte_ts_done - psx_cycle_count);
+         cpu->ld_absorb = stall;
+-        psx_advance_cycles(stall);
++        psx_advance_cycles_raw(stall);
+     } else {
+         cpu->ld_absorb = 0u;
+     }
+@@ -770,7 +791,7 @@ void psx_gte_set(CPUState* cpu, uint32_t latency) {
+     psx_cyc_batch_flush();
+     /* Back-to-back GTE ops serialize: finish the prior op first. */
+     if (cpu->gte_ts_done > psx_cycle_count) {
+-        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
++        psx_advance_cycles_raw((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
+     }
+     cpu->gte_ts_done = psx_cycle_count + (uint64_t)latency;
+ }
+@@ -781,6 +802,6 @@ void psx_gte_stall(CPUState* cpu) {
+      * that work in the stall and can arm a command deadline too early. */
+     psx_cyc_batch_flush();
+     if (cpu->gte_ts_done > psx_cycle_count) {
+-        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
++        psx_advance_cycles_raw((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
+     }
+ }
