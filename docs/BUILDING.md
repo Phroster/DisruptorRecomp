@@ -213,3 +213,20 @@ project's mod source in `src/` and the mod package in `mods/` add the features
 above. `game.toml` records the build-time 60 fps and widescreen patches and all
 build settings. Gameplay-proven extra function seeds live in `seeds/`, so rebuilds
 reproduce the same 100% code coverage.
+
+## Recording gameplay video
+
+The runtime can record frame-exact video and matching audio for trailers. Both
+are off unless their environment variables are set:
+
+- `PSX_GL_FRAME_PIPE` streams one raw RGB24 picture per guest frame (VBlank) to
+  the stdin of a command; `{w}` and `{h}` become the picture size. Example:
+  `ffmpeg -f rawvideo -pix_fmt rgb24 -s {w}x{h} -framerate 60000/1001 -i - -c:v libx264 -crf 14 out.mkv`
+  (the command runs through `cmd /c`, so use paths without spaces). A slow
+  encoder slows the game down instead of dropping frames.
+- `PSX_SPU_CAPTURE=<file>` writes the sound chip's output as raw 16-bit stereo
+  PCM at 44100 Hz on the game clock, starting on the first recorded frame.
+- `PSX_SPU_CAPTURE_NO_CD=1` mutes streamed CD audio (movies);
+  `PSX_SPU_CAPTURE_MUTE_RANGE=1000-25010` mutes Disruptor's level music, which
+  plays from sound RAM `0x1000`-`0x25010`, and keeps the sound effects.
+

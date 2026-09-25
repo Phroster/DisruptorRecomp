@@ -70,24 +70,44 @@ note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
 #     VSync(0);                                  <- ONE blocking wait per pass
 #     if (VSync(-1) - last < 2) VSync(0);        <- 30 fps limiter
 #     ticks = VSync(-1) - last; last = ...       <- logic advances by `ticks`
-# 60 fps = keep the first wait, make the limiter "< 1" so its second wait never
-# runs. The former "loop-wait-04" patch also turned the FIRST wait into
-# VSync(-1); with no wait left the engine free-ran (1.35 passes per VBlank in
-# cheap views, extra passes with ticks = 0 -> ~20 % duplicate pictures, and
-# doubled host CPU cost under the guest overclock).
+# Each pass runs `ticks` logic steps (func_80039450, 0x80043A90), so gameplay
+# keeps its speed at any pass rate. 60 fps = keep the first wait and make the
+# limiter's second wait a no-op. The former "loop-wait-04" patch also turned
+# the FIRST wait into VSync(-1); with no wait left the engine free-ran (1.35
+# passes per VBlank in cheap views, extra passes with ticks = 0 -> ~20 %
+# duplicate pictures, and doubled host CPU cost under the guest overclock).
+#
+# The attract demo is different: in demo mode (mode byte gp+1444 == 3, measured:
+# 0 in menus, 2 in gameplay, 3 in the demo) the loop takes ONE recorded pad
+# word per pass (0x80043930) and then runs exactly two logic steps
+# (0x80043A58), whatever `ticks` says. The recording is paced per pass, so the
+# demo must keep two VBlanks per pass or it plays at double speed. The second
+# wait's argument therefore comes from the mode byte: s1 = mode - 3, which is 0
+# (a real VSync(0) wait) in the demo and negative (VSync returns at once for any
+# negative argument, 0x8004B40C) everywhere else. s1 is free here: last read at
+# 0x80043E58, next written at 0x80043EB4. The limiter compare keeps its
+# original "< 2", so the second call only happens when the pass took less than
+# two VBlanks, exactly as on the console.
 [[recompiler.patch]]
-id = "fps-cap-60-game"
-address = "0x80043E90"
-expected = "0x28420002"
-replacement = "0x28420001"
-note = "gameplay limiter slti 2 -> 1 (one VBlank per pass)"
+id = "demo-pace-mode"
+address = "0x80043E68"
+expected = "0x00000000"
+replacement = "0x939105A4"
+note = "load-delay nop -> lbu s1, 1444(gp) (mode byte)"
+
+[[recompiler.patch]]
+id = "demo-pace-flag"
+address = "0x80043E70"
+expected = "0x00000000"
+replacement = "0x2631FFFD"
+note = "branch-delay nop -> addiu s1, s1, -3 (0 in the attract demo, negative otherwise)"
 
 [[recompiler.patch]]
 id = "loop-wait-05"
 address = "0x80043EA0"
 expected = "0x00002021"
-replacement = "0x2404FFFF"
-note = "frame-sync call a0=0 to a0=-1 (60 fps engine mod)"
+replacement = "0x02202021"
+note = "limiter's second wait: a0 = s1 (VSync(0) in the demo, no-op VSync(<0) in gameplay)"
 
 [[recompiler.patch]]
 id = "loop-wait-06"

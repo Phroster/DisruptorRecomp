@@ -1,0 +1,173 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index dd34608..de2f824 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -4723,6 +4723,79 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+     p_glUseProgram(0);
+ }
+ 
++/* PSX_GL_FRAME_PIPE: stream the presented picture, as raw RGB24 rows top row
++ * first, to the stdin of the given command (for example an ffmpeg encoder), to
++ * record gameplay video: one video frame per guest frame (VBlank). A picture
++ * is written once the next present shows how many guest frames it stayed on
++ * screen, so 30 fps scenes keep their real speed. "{w}" and "{h}" in the
++ * command become the size of the first frame; frames of any other size are
++ * skipped. The frame pacer never drops frames when it falls behind, so a slow
++ * encoder slows the game down instead of losing frames. Arms PSX_SPU_CAPTURE
++ * on the first frame. Off unless the variable is set. */
++static void gl_frame_pipe_write(void) {
++    extern void spu_capture_arm(void);
++    static int s_pipe_init = 0, s_pipe_w = 0, s_pipe_h = 0, s_pipe_have = 0;
++    static uint64_t s_pipe_frame = 0;
++    static FILE *s_pipe = NULL;
++    static uint8_t *s_pipe_rows = NULL, *s_pipe_prev = NULL;
++    if (s_pipe_init && !s_pipe) return;
++    int ww = 0, wh = 0;
++    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
++    if (ww <= 0 || wh <= 0) return;
++    if (!s_pipe_init) {
++        const char *tmpl = getenv("PSX_GL_FRAME_PIPE");
++        char cmd[4096];
++        size_t n = 0;
++        s_pipe_init = 1;
++        if (!tmpl || !*tmpl) return;
++        for (const char *t = tmpl; *t && n + 16 < sizeof(cmd); ) {
++            if (!strncmp(t, "{w}", 3)) { n += (size_t)snprintf(cmd + n, sizeof(cmd) - n, "%d", ww); t += 3; }
++            else if (!strncmp(t, "{h}", 3)) { n += (size_t)snprintf(cmd + n, sizeof(cmd) - n, "%d", wh); t += 3; }
++            else cmd[n++] = *t++;
++        }
++        cmd[n] = '\0';
++        s_pipe_rows = (uint8_t *)malloc((size_t)ww * wh * 3);
++        s_pipe_prev = (uint8_t *)malloc((size_t)ww * wh * 3);
++#ifdef _WIN32
++        s_pipe = (s_pipe_rows && s_pipe_prev) ? _popen(cmd, "wb") : NULL;
++#else
++        s_pipe = (s_pipe_rows && s_pipe_prev) ? popen(cmd, "w") : NULL;
++#endif
++        if (!s_pipe) {
++            free(s_pipe_rows); free(s_pipe_prev);
++            s_pipe_rows = s_pipe_prev = NULL;
++            return;
++        }
++        s_pipe_w = ww;
++        s_pipe_h = wh;
++        spu_capture_arm();
++    }
++    if (ww != s_pipe_w || wh != s_pipe_h) return;
++    const size_t size = (size_t)ww * wh * 3;
++    if (s_pipe_have) {
++        uint64_t held = s_frame_count - s_pipe_frame;
++        int repeat = held < 1 ? 1 : held > 8 ? 8 : (int)held;
++        for (int i = 0; i < repeat && s_pipe; i++) {
++            if (fwrite(s_pipe_prev, 1, size, s_pipe) != size) {
++                /* The consumer went away: stop recording, keep playing. */
++#ifdef _WIN32
++                _pclose(s_pipe);
++#else
++                pclose(s_pipe);
++#endif
++                s_pipe = NULL;
++            }
++        }
++        if (!s_pipe) return;
++    }
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, s_pipe_rows);
++    for (int y = 0; y < wh; y++)
++        memcpy(s_pipe_prev + (size_t)y * ww * 3, s_pipe_rows + (size_t)(wh - 1 - y) * ww * 3, (size_t)ww * 3);
++    s_pipe_frame = s_frame_count;
++    s_pipe_have = 1;
++}
++
+ /* Composite host toast + volume bar into the default framebuffer, then swap. */
+ static void gl_swap_with_osd(void) {
+     if (s_present_prog && s_ctx) {
+@@ -4760,6 +4833,7 @@ static void gl_swap_with_osd(void) {
+         }
+     }
+     host_osd_present_done();
++    gl_frame_pipe_write();
+     /* present_shot (GL backend): the default framebuffer now holds the composed
+      * frame — display quad fitted to the window, plus OSD — so this is the only
+      * capture that carries the presented aspect. Buffer-level captures resolve
+diff --git a/runtime/src/spu.c b/runtime/src/spu.c
+index 0e3c034..a51f0b1 100644
+--- a/runtime/src/spu.c
++++ b/runtime/src/spu.c
+@@ -983,8 +983,41 @@ void spu_init(void) {
+     spu_shadow_reset();
+ }
+ 
++/* PSX_SPU_CAPTURE=<file>: write the sound chip's output as raw 16-bit stereo
++ * PCM at 44100 Hz on the guest clock (one sample per 768 guest cycles), to
++ * record gameplay video together with PSX_GL_FRAME_PIPE. Writing starts when
++ * the video recorder takes its first frame (spu_capture_arm), so both streams
++ * start on the same guest frame. PSX_SPU_CAPTURE_NO_CD=1 mutes the CD audio
++ * input (streamed XA / CD-DA: music and movie sound).
++ * PSX_SPU_CAPTURE_MUTE_RANGE=<lo>-<hi> (hex byte addresses in sound RAM) leaves
++ * out every voice whose sample starts in [lo, hi), for games that play their
++ * music from sound RAM (the voices keep running; only their output is
++ * dropped). Off unless set. */
++static FILE *s_capture_file;
++static int s_capture_init, s_capture_armed, s_capture_no_cd;
++static uint32_t s_capture_mute_lo, s_capture_mute_hi;
++
++static void spu_capture_setup(void) {
++    const char *path, *no_cd;
++    if (s_capture_init) return;
++    s_capture_init = 1;
++    no_cd = getenv("PSX_SPU_CAPTURE_NO_CD");
++    s_capture_no_cd = no_cd && no_cd[0] == '1';
++    const char *range = getenv("PSX_SPU_CAPTURE_MUTE_RANGE");
++    if (range && *range) {
++        char *end = NULL;
++        s_capture_mute_lo = (uint32_t)strtoul(range, &end, 16);
++        if (end && *end == '-') s_capture_mute_hi = (uint32_t)strtoul(end + 1, NULL, 16);
++    }
++    path = getenv("PSX_SPU_CAPTURE");
++    if (path && *path) s_capture_file = fopen(path, "wb");
++}
++
++void spu_capture_arm(void) { s_capture_armed = 1; }
++
+ void spu_render(int16_t* out_stereo, int frames) {
+     if (!out_stereo || frames <= 0) return;
++    spu_capture_setup();
+ 
+     uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
+     int enabled  = (ctrl & 0x8000u) != 0;
+@@ -993,6 +1026,7 @@ void spu_render(int16_t* out_stereo, int frames) {
+     int rev_wren = (ctrl & 0x0080u) != 0;           /* reverb work-area write enable */
+     int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
+     int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
++    if (s_capture_no_cd) { cd_vol_l = 0; cd_vol_r = 0; }
+     uint32_t eon = (uint32_t)spu_regs[reg_index(0x1F801D98u)]
+                  | ((uint32_t)spu_regs[reg_index(0x1F801D9Au)] << 16);
+ 
+@@ -1165,6 +1199,10 @@ void spu_render(int16_t* out_stereo, int frames) {
+                         t->vol_r = (int16_t)(vr >> 1);
+                     }
+                     if (!s) continue;
++                    if (s_capture_mute_hi) {
++                        uint32_t start = (uint32_t)voice_reg(v, 3) << 3;
++                        if (start >= s_capture_mute_lo && start < s_capture_mute_hi) continue;
++                    }
+                     int32_t cl = ((int32_t)s * vl) >> 15;
+                     int32_t cr = ((int32_t)s * vr) >> 15;
+                     voice_l += cl;
+@@ -1310,6 +1348,15 @@ void spu_render(int16_t* out_stereo, int frames) {
+      * (post-shadow, pre host fade/mute). Placed here so every spu_render
+      * caller — the vblank pump and the turbo fade tail — is covered. */
+     audio_trace_pcm(AUDIO_TAP_SPU_OUT, out_stereo, frames);
++
++    if (s_capture_file && s_capture_armed) {
++        if (fwrite(out_stereo, sizeof(int16_t) * 2u, (size_t)frames, s_capture_file) != (size_t)frames) {
++            fclose(s_capture_file);   /* disk full or gone: stop recording, keep playing */
++            s_capture_file = NULL;
++        } else {
++            fflush(s_capture_file);
++        }
++    }
+ }
+ 
+ void spu_debug_info(SpuDebugInfo* out) {

@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0-rc.1",
-  "windows_version": "1.0.0.0",
+  "version": "1.0.0-rc.2",
+  "windows_version": "1.0.0.2",
   "disc_size": 636350064,
   "disc_sha256": "3b49f9874e30c613ca9d17720716764cd76d0ac968c0acd0f53159366c0cf3a4",
   "disc_id": "SLUS-00224"
