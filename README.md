@@ -6,6 +6,7 @@
   <a href="https://github.com/Phroster/DisruptorRecomp/releases/latest"><img alt="Download" src="https://img.shields.io/badge/download-release%20candidate-5be8da?style=for-the-badge&labelColor=0c1118"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-5be8da?style=for-the-badge&labelColor=0c1118">
   <img alt="Noncommercial" src="https://img.shields.io/badge/license-noncommercial-5be8da?style=for-the-badge&labelColor=0c1118">
+  <a href="https://ko-fi.com/phrostworks"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-5be8da?style=for-the-badge&logo=kofi&logoColor=white&labelColor=0c1118"></a>
 </p>
 
 <p align="center">
