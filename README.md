@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer-720p.mp4"><img src="docs/images/trailer.jpg" alt="Watch the trailer" width="80%"></a><br>
-  <sub>🎬 <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer-720p.mp4">Trailer, 720p (9 MB)</a> · <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer.mp4">1080p60 (100 MB)</a></sub>
+  <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer-720p.mp4"><img src="docs/images/trailer-preview.webp" alt="Disruptor Recompiled gameplay at 60 fps" width="100%"></a><br>
+  <sub>🎬 Full trailer with sound: <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer-720p.mp4">720p (9 MB)</a> · <a href="https://github.com/Phroster/DisruptorRecomp/releases/download/v1.0.0-rc.2/DisruptorRecompiled-Trailer.mp4">1080p60 (100 MB)</a></sub>
 </p>
 
 ---
