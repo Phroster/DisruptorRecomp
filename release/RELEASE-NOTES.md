@@ -40,5 +40,6 @@ launcher's **Logs folder**. Hearing that levels play fine is just as useful!
 
 - `DisruptorRecompiled-1.0.0-rc.2-Setup.exe`: the installer
 - `SHA256SUMS.txt`: checksum of the installer
+- `DisruptorRecompiled-Trailer.mp4` / `-720p.mp4`: the 60-second trailer
 - `toolchain-source-code.zip`: source code of the open-source build tools included in the installer
   (GCC, binutils, MinGW-w64 and libraries), provided as their licenses require. You don't need it to play.
