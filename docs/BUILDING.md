@@ -221,11 +221,13 @@ are off unless their environment variables are set:
 
 - `PSX_GL_FRAME_PIPE` streams one raw RGB24 picture per guest frame (VBlank) to
   the stdin of a command; `{w}` and `{h}` become the picture size. Example:
-  `ffmpeg -f rawvideo -pix_fmt rgb24 -s {w}x{h} -framerate 60000/1001 -i - -c:v libx264 -crf 14 out.mkv`
+  `ffmpeg -f rawvideo -pix_fmt rgb24 -s {w}x{h} -framerate 60 -i - -c:v libx264 -crf 14 out.mkv`
   (the command runs through `cmd /c`, so use paths without spaces). A slow
   encoder slows the game down instead of dropping frames.
-- `PSX_SPU_CAPTURE=<file>` writes the sound chip's output as raw 16-bit stereo
-  PCM at 44100 Hz on the game clock, starting on the first recorded frame.
+- `PSX_SPU_CAPTURE=<file>` (with `PSX_GL_FRAME_PIPE`) writes the sound chip's
+  output as raw 16-bit stereo PCM at 44100 Hz, starting on the first recorded
+  frame and kept in step with the video: 735 samples per video frame, with
+  silence where the game renders no sound (loading, movies).
 - `PSX_SPU_CAPTURE_NO_CD=1` mutes streamed CD audio (movies);
   `PSX_SPU_CAPTURE_MUTE_RANGE=1000-25010` mutes Disruptor's level music, which
   plays from sound RAM `0x1000`-`0x25010`, and keeps the sound effects.

@@ -1,8 +1,8 @@
 diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
-index dd34608..de2f824 100644
+index dd34608..b1af4cf 100644
 --- a/runtime/src/gpu_gl_renderer.c
 +++ b/runtime/src/gpu_gl_renderer.c
-@@ -4723,6 +4723,79 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+@@ -4723,6 +4723,82 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
      p_glUseProgram(0);
  }
  
@@ -56,8 +56,11 @@ index dd34608..de2f824 100644
 +    if (ww != s_pipe_w || wh != s_pipe_h) return;
 +    const size_t size = (size_t)ww * wh * 3;
 +    if (s_pipe_have) {
-+        uint64_t held = s_frame_count - s_pipe_frame;
-+        int repeat = held < 1 ? 1 : held > 8 ? 8 : (int)held;
++        /* One video frame per guest frame: the previous picture stays up until
++         * this one (up to a minute, for loading screens); a second present in
++         * the same guest frame replaces it. */
++        uint64_t held = s_frame_count >= s_pipe_frame ? s_frame_count - s_pipe_frame : 1;
++        int repeat = held > 3600 ? 3600 : (int)held;
 +        for (int i = 0; i < repeat && s_pipe; i++) {
 +            if (fwrite(s_pipe_prev, 1, size, s_pipe) != size) {
 +                /* The consumer went away: stop recording, keep playing. */
@@ -82,7 +85,7 @@ index dd34608..de2f824 100644
  /* Composite host toast + volume bar into the default framebuffer, then swap. */
  static void gl_swap_with_osd(void) {
      if (s_present_prog && s_ctx) {
-@@ -4760,6 +4833,7 @@ static void gl_swap_with_osd(void) {
+@@ -4760,6 +4836,7 @@ static void gl_swap_with_osd(void) {
          }
      }
      host_osd_present_done();
@@ -91,18 +94,20 @@ index dd34608..de2f824 100644
       * frame — display quad fitted to the window, plus OSD — so this is the only
       * capture that carries the presented aspect. Buffer-level captures resolve
 diff --git a/runtime/src/spu.c b/runtime/src/spu.c
-index 0e3c034..a51f0b1 100644
+index 0e3c034..2ebb650 100644
 --- a/runtime/src/spu.c
 +++ b/runtime/src/spu.c
-@@ -983,8 +983,41 @@ void spu_init(void) {
+@@ -983,8 +983,50 @@ void spu_init(void) {
      spu_shadow_reset();
  }
  
 +/* PSX_SPU_CAPTURE=<file>: write the sound chip's output as raw 16-bit stereo
-+ * PCM at 44100 Hz on the guest clock (one sample per 768 guest cycles), to
-+ * record gameplay video together with PSX_GL_FRAME_PIPE. Writing starts when
-+ * the video recorder takes its first frame (spu_capture_arm), so both streams
-+ * start on the same guest frame. PSX_SPU_CAPTURE_NO_CD=1 mutes the CD audio
++ * PCM at 44100 Hz, to record gameplay video together with PSX_GL_FRAME_PIPE.
++ * Writing starts when the video recorder takes its first frame
++ * (spu_capture_arm), and every block is placed by the guest frame counter the
++ * video uses: stretches the runtime does not render (long loads, movies) are
++ * padded with silence and blocks running ahead are dropped, so audio and video
++ * stay in step. PSX_SPU_CAPTURE_NO_CD=1 mutes the CD audio
 + * input (streamed XA / CD-DA: music and movie sound).
 + * PSX_SPU_CAPTURE_MUTE_RANGE=<lo>-<hi> (hex byte addresses in sound RAM) leaves
 + * out every voice whose sample starts in [lo, hi), for games that play their
@@ -111,6 +116,8 @@ index 0e3c034..a51f0b1 100644
 +static FILE *s_capture_file;
 +static int s_capture_init, s_capture_armed, s_capture_no_cd;
 +static uint32_t s_capture_mute_lo, s_capture_mute_hi;
++static uint64_t s_capture_frame0, s_capture_base, s_capture_written;
++extern uint32_t vblank_cycles;   /* guest cycles per VBlank, interrupts.c */
 +
 +static void spu_capture_setup(void) {
 +    const char *path, *no_cd;
@@ -128,7 +135,12 @@ index 0e3c034..a51f0b1 100644
 +    if (path && *path) s_capture_file = fopen(path, "wb");
 +}
 +
-+void spu_capture_arm(void) { s_capture_armed = 1; }
++void spu_capture_arm(void) {
++    s_capture_armed = 1;
++    s_capture_frame0 = s_frame_count;
++    s_capture_base = 0;
++    s_capture_written = 0;
++}
 +
  void spu_render(int16_t* out_stereo, int frames) {
      if (!out_stereo || frames <= 0) return;
@@ -136,7 +148,7 @@ index 0e3c034..a51f0b1 100644
  
      uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
      int enabled  = (ctrl & 0x8000u) != 0;
-@@ -993,6 +1026,7 @@ void spu_render(int16_t* out_stereo, int frames) {
+@@ -993,6 +1035,7 @@ void spu_render(int16_t* out_stereo, int frames) {
      int rev_wren = (ctrl & 0x0080u) != 0;           /* reverb work-area write enable */
      int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
      int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
@@ -144,7 +156,7 @@ index 0e3c034..a51f0b1 100644
      uint32_t eon = (uint32_t)spu_regs[reg_index(0x1F801D98u)]
                   | ((uint32_t)spu_regs[reg_index(0x1F801D9Au)] << 16);
  
-@@ -1165,6 +1199,10 @@ void spu_render(int16_t* out_stereo, int frames) {
+@@ -1165,6 +1208,10 @@ void spu_render(int16_t* out_stereo, int frames) {
                          t->vol_r = (int16_t)(vr >> 1);
                      }
                      if (!s) continue;
@@ -155,13 +167,37 @@ index 0e3c034..a51f0b1 100644
                      int32_t cl = ((int32_t)s * vl) >> 15;
                      int32_t cr = ((int32_t)s * vr) >> 15;
                      voice_l += cl;
-@@ -1310,6 +1348,15 @@ void spu_render(int16_t* out_stereo, int frames) {
+@@ -1310,6 +1357,39 @@ void spu_render(int16_t* out_stereo, int frames) {
       * (post-shadow, pre host fade/mute). Placed here so every spu_render
       * caller — the vblank pump and the turbo fade tail — is covered. */
      audio_trace_pcm(AUDIO_TAP_SPU_OUT, out_stereo, frames);
 +
 +    if (s_capture_file && s_capture_armed) {
-+        if (fwrite(out_stereo, sizeof(int16_t) * 2u, (size_t)frames, s_capture_file) != (size_t)frames) {
++        /* Where this block should end on the video's clock: one video frame
++         * per guest frame, vblank_cycles / 768 samples each (735 on NTSC). */
++        const uint64_t per_frame = vblank_cycles / 768u;
++        const uint64_t slack = 2u * per_frame;
++        if (s_frame_count < s_capture_frame0) {   /* frame counter was reset */
++            s_capture_base = s_capture_written;
++            s_capture_frame0 = s_frame_count;
++        }
++        const uint64_t due = s_capture_base + (s_frame_count - s_capture_frame0) * per_frame;
++        int ok = 1;
++        if (s_capture_written + (uint64_t)frames + slack < due) {
++            static const int16_t zero[512 * 2];
++            uint64_t gap = due - s_capture_written - (uint64_t)frames;
++            while (gap > 0 && ok) {
++                size_t n = gap > 512u ? 512u : (size_t)gap;
++                ok = fwrite(zero, sizeof(int16_t) * 2u, n, s_capture_file) == n;
++                gap -= n;
++                s_capture_written += n;
++            }
++        }
++        if (ok && s_capture_written <= due + slack) {
++            ok = fwrite(out_stereo, sizeof(int16_t) * 2u, (size_t)frames, s_capture_file) == (size_t)frames;
++            s_capture_written += (uint64_t)frames;
++        }
++        if (!ok) {
 +            fclose(s_capture_file);   /* disk full or gone: stop recording, keep playing */
 +            s_capture_file = NULL;
 +        } else {
