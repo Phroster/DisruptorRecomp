@@ -27,6 +27,29 @@
 | 💾 **Savestates** | Save anywhere with **F7**, alongside the game's normal memory-card saves. |
 | ⚙️ **A launcher with every setting** | Change graphics, controls and more, and rebind any key or mouse button. |
 
+## 📸 Screenshots
+
+<p align="center">
+  <img src="docs/images/screenshots/firefight.jpg" alt="A firefight in a base corridor" width="100%">
+</p>
+
+<table>
+  <tr>
+    <td><img src="docs/images/screenshots/base-exterior.jpg" alt="Looking out over the city from a base"></td>
+    <td><img src="docs/images/screenshots/laser.jpg" alt="Firing a laser at an enemy soldier"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/screenshots/robot.jpg" alt="A heavy robot in a purple base"></td>
+    <td><img src="docs/images/screenshots/ice-caves.jpg" alt="A plasma blast in the ice caves"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/screenshots/night-base.jpg" alt="An enemy waiting in a dark base"></td>
+    <td><img src="docs/images/screenshots/lava.jpg" alt="Reaching a checkpoint above a lava lake"></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Captured in widescreen at 1920×1080 with the default settings.</sub></p>
+
 ## 💿 What you need
 
 - 🪟 A 64-bit **Windows 10 or 11** PC with a graphics card that supports OpenGL 3.3 (almost any PC from the last 10 years).
